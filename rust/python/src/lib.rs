@@ -1,4 +1,4 @@
-//! `datafusion_lambda_benchmarks._native`: a session over Zarr tables that fans
+//! `zarr_datafusion_lambda._native`: a session over Zarr tables that fans
 //! out on map-lambda, as Python sees it.
 
 use std::collections::{BTreeMap, HashMap};

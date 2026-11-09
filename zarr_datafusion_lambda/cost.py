@@ -4,7 +4,7 @@ What a run cost, priced from the CloudWatch REPORT lines of its invocations.
 
 from typing import Any
 
-from datafusion_lambda_benchmarks.prices import (
+from zarr_datafusion_lambda.prices import (
     GB_SECOND_USD,
     PRICING_AS_OF,
     REQUEST_USD,

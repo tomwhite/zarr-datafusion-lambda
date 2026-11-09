@@ -1,6 +1,6 @@
 from itertools import pairwise
 
-from datafusion_lambda_benchmarks.cloudwatch import (
+from zarr_datafusion_lambda.cloudwatch import (
     SLICE_RECORDS,
     join,
     query_all_reports,
@@ -64,7 +64,7 @@ def test_reports_join_their_invocations():
 
 
 def test_reports_stop_when_a_rerun_finds_no_more(monkeypatch):
-    monkeypatch.setattr("datafusion_lambda_benchmarks.cloudwatch.time.sleep", lambda s: None)
+    monkeypatch.setattr("zarr_datafusion_lambda.cloudwatch.time.sleep", lambda s: None)
     warm = {"@duration": "1", "@billedDuration": "1", "@memorySize": "1", "@maxMemoryUsed": "1"}
     logs = Logs({"a": (1001, warm)})
     records = [{"invoke_start": 1000, "invoke_end": 1001}]

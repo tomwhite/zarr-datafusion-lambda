@@ -2,7 +2,7 @@ from typing import Any
 
 import pytest
 
-from datafusion_lambda_benchmarks.cost import (
+from zarr_datafusion_lambda.cost import (
     GB_SECOND_USD,
     REQUEST_USD,
     S3_GET_USD,

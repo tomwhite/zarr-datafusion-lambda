@@ -5,7 +5,7 @@ The workers must be in the bucket's region, as the deploy spec fixes, and
 allowed to write to the output's:
 
 \b
-    uv run datafusion-lambda-benchmarks deploy --from-source --allow-bucket ...
+    uv run zarr-datafusion-lambda deploy --from-source --allow-bucket ...
     eval "$(aws configure export-credentials --format env)"; export AWS_REGION=us-east-1
     uv run python benchmarks/climatology.py s3://.../climatology.zarr
 
@@ -27,7 +27,7 @@ import boto3
 import click
 from map_lambda import LOCAL_ENDPOINT_URL
 
-from datafusion_lambda_benchmarks import runs, sql
+from zarr_datafusion_lambda import runs, sql
 
 URL = "s3://earthmover-icechunk-era5/icechunkV2"
 GROUP = "single/temporal"

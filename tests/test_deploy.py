@@ -1,13 +1,13 @@
 from click.testing import CliRunner
 from map_lambda.deploy import spec
 
-from datafusion_lambda_benchmarks.cli import cli
-from datafusion_lambda_benchmarks.deploy import PROJECT, SPEC
-from datafusion_lambda_benchmarks.runs import FUNCTION
+from zarr_datafusion_lambda.cli import cli
+from zarr_datafusion_lambda.deploy import PROJECT, SPEC
+from zarr_datafusion_lambda.runs import FUNCTION
 
 
-def test_the_project_is_named_in_the_spec():
-    assert PROJECT == "datafusion-lambda"
+def test_the_project_takes_the_distribution_s_name():
+    assert PROJECT == "zarr-datafusion-lambda"
 
 
 def test_the_spec_deploys_the_worker_the_client_calls():

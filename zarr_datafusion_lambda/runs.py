@@ -13,9 +13,9 @@ import boto3
 import numpy as np
 from map_lambda import DISPATCHER, Session
 
-from datafusion_lambda_benchmarks import cost, sql
-from datafusion_lambda_benchmarks.cloudwatch import join, query_all_reports, query_windows
-from datafusion_lambda_benchmarks.deploy import PROJECT
+from zarr_datafusion_lambda import cost, sql
+from zarr_datafusion_lambda.cloudwatch import join, query_all_reports, query_windows
+from zarr_datafusion_lambda.deploy import PROJECT
 
 FUNCTION = "fragment"
 

@@ -4,7 +4,7 @@ import pytest
 import zarr
 from map_lambda import LOCAL_ENDPOINT_URL
 
-from datafusion_lambda_benchmarks.sql import run
+from zarr_datafusion_lambda.sql import run
 
 LOCAL = {"endpoint_url": LOCAL_ENDPOINT_URL, "concurrency": 100}
 GROUP = "single/spatial"

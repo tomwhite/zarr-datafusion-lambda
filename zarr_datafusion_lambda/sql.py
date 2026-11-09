@@ -12,8 +12,8 @@ from urllib.parse import unquote, urlparse
 import pyarrow as pa
 from tqdm import tqdm
 
-from datafusion_lambda_benchmarks._native import Session
-from datafusion_lambda_benchmarks.deploy import PROJECT
+from zarr_datafusion_lambda._native import Session
+from zarr_datafusion_lambda.deploy import PROJECT
 
 
 def location(url: str) -> str:

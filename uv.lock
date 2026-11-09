@@ -174,49 +174,6 @@ wheels = [
 ]
 
 [[package]]
-name = "datafusion-lambda-benchmarks"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "boto3" },
-    { name = "click" },
-    { name = "map-lambda", extra = ["deploy"] },
-    { name = "numpy" },
-    { name = "pyarrow" },
-    { name = "tqdm" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "datafusion" },
-    { name = "icechunk" },
-    { name = "map-lambda", extra = ["diagnostics"] },
-    { name = "pytest" },
-    { name = "ruff" },
-    { name = "zarr" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "boto3", specifier = ">=1.40.61" },
-    { name = "click", specifier = ">=8.1" },
-    { name = "map-lambda", extras = ["deploy"], git = "https://github.com/tomwhite/map-lambda?rev=bb0893a" },
-    { name = "numpy" },
-    { name = "pyarrow" },
-    { name = "tqdm" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "datafusion", specifier = ">=55.0.0" },
-    { name = "icechunk", specifier = ">=2" },
-    { name = "map-lambda", extras = ["diagnostics"], git = "https://github.com/tomwhite/map-lambda?rev=bb0893a" },
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "ruff", specifier = ">=0.16.5" },
-    { name = "zarr", specifier = ">=3" },
-]
-
-[[package]]
 name = "donfig"
 version = "0.8.1.post1"
 source = { registry = "https://pypi.org/simple" }
@@ -1043,4 +1000,47 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/3e/62/e8a36a4b65f01499c7aefcf103aabba0c37c018bf135fbf179f6ed2f01a0/zarr-3.4.1.tar.gz", hash = "sha256:b34bda11ceb199c81ee78ecd42cd02f46c7f67a6d8a1e9bc501cafd5a1795356", size = 923257, upload-time = "2026-10-08T17:14:25.972Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a6/82/0dbc9bc77b49cfb9268dc2b2b1dcd04346c8c7ed52e272b76a628a941656/zarr-3.4.1-py3-none-any.whl", hash = "sha256:38b540578a119352bdce02a720d7bfd99846e77f0728c58b1bab3d1f547526a0", size = 405257, upload-time = "2026-10-08T17:14:23.926Z" },
+]
+
+[[package]]
+name = "zarr-datafusion-lambda"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "boto3" },
+    { name = "click" },
+    { name = "map-lambda", extra = ["deploy"] },
+    { name = "numpy" },
+    { name = "pyarrow" },
+    { name = "tqdm" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "datafusion" },
+    { name = "icechunk" },
+    { name = "map-lambda", extra = ["diagnostics"] },
+    { name = "pytest" },
+    { name = "ruff" },
+    { name = "zarr" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "boto3", specifier = ">=1.40.61" },
+    { name = "click", specifier = ">=8.1" },
+    { name = "map-lambda", extras = ["deploy"], git = "https://github.com/tomwhite/map-lambda?rev=bb0893a" },
+    { name = "numpy" },
+    { name = "pyarrow" },
+    { name = "tqdm" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "datafusion", specifier = ">=55.0.0" },
+    { name = "icechunk", specifier = ">=2" },
+    { name = "map-lambda", extras = ["diagnostics"], git = "https://github.com/tomwhite/map-lambda?rev=bb0893a" },
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "ruff", specifier = ">=0.16.5" },
+    { name = "zarr", specifier = ">=3" },
 ]

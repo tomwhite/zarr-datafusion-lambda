@@ -1,4 +1,4 @@
-# datafusion-lambda-benchmarks
+# zarr-datafusion-lambda
 
 How fast can we query ERA5 Zarr data using SQL and the [map-lambda](https://github.com/tomwhite/map-lambda) framework?
 
@@ -53,9 +53,9 @@ cd rust && cargo test
 
 ## Running on AWS
 
-The lambdas are deployed as the map-lambda project `datafusion-lambda`,
-described by `datafusion_lambda_benchmarks/deploy.toml`: one CloudFormation
-stack holding `datafusion-lambda-dispatcher`, `datafusion-lambda-fragment`,
+The lambdas are deployed as the map-lambda project `zarr-datafusion-lambda`,
+described by `zarr_datafusion_lambda/deploy.toml`: one CloudFormation
+stack holding `zarr-datafusion-lambda-dispatcher`, `zarr-datafusion-lambda-fragment`,
 their roles and their logs. Building needs Rust, [Zig](https://ziglang.org/)
 and [cargo lambda](https://www.cargo-lambda.info/).
 
@@ -64,9 +64,9 @@ to run otherwise), which the spec fixes. ERA5 is read anonymously, so a
 bucket only needs allowing for the climatology, which the workers write to:
 
 ```shell
-uv run datafusion-lambda-benchmarks deploy --from-source --allow-bucket <bucket>
-uv run datafusion-lambda-benchmarks list      # what is deployed
-uv run datafusion-lambda-benchmarks delete    # when you're finished; the bucket and its data stay
+uv run zarr-datafusion-lambda deploy --from-source --allow-bucket <bucket>
+uv run zarr-datafusion-lambda list      # what is deployed
+uv run zarr-datafusion-lambda delete    # when you're finished; the bucket and its data stay
 ```
 
 Deploy again after any change; the stack remembers the bucket.

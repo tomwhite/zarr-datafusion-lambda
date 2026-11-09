@@ -4,7 +4,7 @@ ERA5, an Icechunk repo in us-east-1, fanned out from a window's hourly
 chunks. The workers must be in the bucket's region, as the deploy spec fixes:
 
 \b
-    uv run datafusion-lambda-benchmarks deploy --from-source
+    uv run zarr-datafusion-lambda deploy --from-source
     eval "$(aws configure export-credentials --format env)"; export AWS_REGION=us-east-1
     uv run python benchmarks/demo.py --start 2020-01-01 --end 2020-04-01
 
@@ -29,7 +29,7 @@ import numpy as np
 from map_lambda import LOCAL_ENDPOINT_URL
 from zarr.core.buffer import default_buffer_prototype
 
-from datafusion_lambda_benchmarks import runs, sql
+from zarr_datafusion_lambda import runs, sql
 
 URL = "s3://earthmover-icechunk-era5/icechunkV2"
 GROUP = "single/spatial"

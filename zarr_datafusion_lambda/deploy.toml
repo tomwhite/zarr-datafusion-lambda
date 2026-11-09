@@ -1,4 +1,3 @@
-project = "datafusion-lambda"
 workspace = "../rust"
 # next to ERA5, which a query refuses to read from another region
 region = "us-east-1"

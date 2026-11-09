@@ -1,5 +1,5 @@
 [project]
-name = "datafusion-lambda-benchmarks"
+name = "zarr-datafusion-lambda"
 version = "0.1.0"
 authors = [
     { name = "Tom White", email = "tom.e.white@gmail.com" }
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-datafusion-lambda-benchmarks = "datafusion_lambda_benchmarks.cli:cli"
+zarr-datafusion-lambda = "zarr_datafusion_lambda.cli:cli"
 
 [tool.uv.sources]
 map-lambda = { git = "https://github.com/tomwhite/map-lambda", rev = "bb0893a" }
@@ -26,9 +26,9 @@ build-backend = "maturin"
 
 [tool.maturin]
 manifest-path = "rust/python/Cargo.toml"
-module-name = "datafusion_lambda_benchmarks._native"
+module-name = "zarr_datafusion_lambda._native"
 python-source = "."
-include = [{ path = "datafusion_lambda_benchmarks/**/*.py", format = "sdist" }]
+include = [{ path = "zarr_datafusion_lambda/**/*.py", format = "sdist" }]
 
 [tool.uv]
 # rebuild the extension when the Rust it is built from changes
@@ -61,4 +61,4 @@ dev = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["datafusion_lambda_benchmarks"]
+known-first-party = ["zarr_datafusion_lambda"]

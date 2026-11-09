@@ -26,7 +26,7 @@ import xarray as xr
 import zarr
 from map_lambda import LOCAL_ENDPOINT_URL
 
-from datafusion_lambda_benchmarks.sql import run
+from zarr_datafusion_lambda.sql import run
 
 BUCKET, PREFIX = "earthmover-icechunk-era5", "icechunkV2"
 GROUP = "single/temporal"

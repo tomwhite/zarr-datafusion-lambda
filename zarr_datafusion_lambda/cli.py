@@ -1,9 +1,9 @@
-"""The `datafusion-lambda-benchmarks` command line."""
+"""The `zarr-datafusion-lambda` command line."""
 
 import click
 import map_lambda.deploy
 
-from datafusion_lambda_benchmarks.deploy import SPEC
+from zarr_datafusion_lambda.deploy import SPEC
 
 
 @click.group()
