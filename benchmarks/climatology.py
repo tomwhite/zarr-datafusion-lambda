@@ -6,7 +6,7 @@ allowed to write to the output's:
 
 \b
     uv run zarr-datafusion-lambda deploy --from-source --allow-bucket ...
-    eval "$(aws configure export-credentials --format env)"; export AWS_REGION=us-east-1
+    export AWS_REGION=us-east-1
     uv run python benchmarks/climatology.py s3://.../climatology.zarr
 
 By default a week, inside one band of pencils: it still writes every tile, but
