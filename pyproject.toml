@@ -1,6 +1,6 @@
 [project]
 name = "zarr-datafusion-lambda"
-version = "0.1.0"
+version = "0.1.0.dev1"
 authors = [
     { name = "Tom White", email = "tom.e.white@gmail.com" }
 ]
@@ -8,7 +8,7 @@ requires-python = ">=3.12"
 dependencies = [
     "boto3>=1.40.61",
     "click>=8.1",
-    "map-lambda[deploy]",
+    "map-lambda[deploy]==0.1.0.dev1",
     "numpy",
     "pyarrow",
     "tqdm",
@@ -18,7 +18,7 @@ dependencies = [
 zarr-datafusion-lambda = "zarr_datafusion_lambda.cli:cli"
 
 [tool.uv.sources]
-map-lambda = { git = "https://github.com/tomwhite/map-lambda", rev = "bb0893a" }
+map-lambda = { git = "https://github.com/tomwhite/map-lambda", tag = "v0.1.0.dev1" }
 
 [build-system]
 requires = ["maturin>=1.9,<2"]
@@ -28,7 +28,11 @@ build-backend = "maturin"
 manifest-path = "rust/python/Cargo.toml"
 module-name = "zarr_datafusion_lambda._native"
 python-source = "."
-include = [{ path = "zarr_datafusion_lambda/**/*.py", format = "sdist" }]
+include = [
+    { path = "zarr_datafusion_lambda/**/*.py", format = "sdist" },
+    # Gitignored, so only included when named.
+    { path = "zarr_datafusion_lambda/*.sha256", format = "wheel" },
+]
 
 [tool.uv]
 # rebuild the extension when the Rust it is built from changes

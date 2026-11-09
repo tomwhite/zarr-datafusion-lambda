@@ -6,7 +6,7 @@ from zarr_datafusion_lambda.deploy import PROJECT, SPEC
 from zarr_datafusion_lambda.runs import FUNCTION
 
 
-def test_the_project_takes_the_distribution_s_name():
+def test_the_project_is_the_distribution_s_name():
     assert PROJECT == "zarr-datafusion-lambda"
 
 

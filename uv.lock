@@ -425,8 +425,8 @@ wheels = [
 
 [[package]]
 name = "map-lambda"
-version = "0.1.0"
-source = { git = "https://github.com/tomwhite/map-lambda?rev=bb0893a#bb0893a6a0c71be72dde4419991e891caf5912b3" }
+version = "0.1.0.dev1"
+source = { git = "https://github.com/tomwhite/map-lambda?tag=v0.1.0.dev1#e074d4c7dbce2be6ccf235741cf6dddc85176606" }
 
 [package.optional-dependencies]
 deploy = [
@@ -1004,7 +1004,7 @@ wheels = [
 
 [[package]]
 name = "zarr-datafusion-lambda"
-version = "0.1.0"
+version = "0.1.0.dev1"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
@@ -1029,7 +1029,7 @@ dev = [
 requires-dist = [
     { name = "boto3", specifier = ">=1.40.61" },
     { name = "click", specifier = ">=8.1" },
-    { name = "map-lambda", extras = ["deploy"], git = "https://github.com/tomwhite/map-lambda?rev=bb0893a" },
+    { name = "map-lambda", extras = ["deploy"], git = "https://github.com/tomwhite/map-lambda?tag=v0.1.0.dev1" },
     { name = "numpy" },
     { name = "pyarrow" },
     { name = "tqdm" },
@@ -1039,7 +1039,7 @@ requires-dist = [
 dev = [
     { name = "datafusion", specifier = ">=55.0.0" },
     { name = "icechunk", specifier = ">=2" },
-    { name = "map-lambda", extras = ["diagnostics"], git = "https://github.com/tomwhite/map-lambda?rev=bb0893a" },
+    { name = "map-lambda", extras = ["diagnostics"], git = "https://github.com/tomwhite/map-lambda?tag=v0.1.0.dev1" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.16.5" },
     { name = "zarr", specifier = ">=3" },

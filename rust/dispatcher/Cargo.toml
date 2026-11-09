@@ -8,5 +8,5 @@ edition = "2021"
 
 [dependencies]
 lambda_runtime = "1.0.1"
-map-lambda-dispatcher = { git = "https://github.com/tomwhite/map-lambda", rev = "bb0893a" }
+map-lambda-dispatcher = { git = "https://github.com/tomwhite/map-lambda", tag = "v0.1.0.dev1" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
