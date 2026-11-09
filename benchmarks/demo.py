@@ -5,7 +5,7 @@ chunks. The workers must be in the bucket's region, as the deploy spec fixes:
 
 \b
     uv run zarr-datafusion-lambda deploy --from-source
-    eval "$(aws configure export-credentials --format env)"; export AWS_REGION=us-east-1
+    export AWS_REGION=us-east-1
     uv run python benchmarks/demo.py --start 2020-01-01 --end 2020-04-01
 
 It checks that pruning kept exactly the window's chunks, each month's count,

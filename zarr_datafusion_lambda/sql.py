@@ -5,10 +5,12 @@ query with nothing to fan out runs here entirely.
 """
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+import boto3
 import pyarrow as pa
 from tqdm import tqdm
 
@@ -34,6 +36,30 @@ def _table(table: Table) -> tuple[str, dict[str, str]]:
     return location(options.pop("url")), options
 
 
+def export_credentials() -> None:
+    """
+    Put the credentials the `aws` CLI would use (a profile, SSO, CloudShell's) in the
+    `AWS_*` variables, the only ones zarr-datafusion's S3 stores read, unless they're
+    set already. Once per process, as changing the environment while queries run
+    could race with the stores reading it.
+    """
+    global _exported
+    if _exported or "AWS_ACCESS_KEY_ID" in os.environ:
+        return
+    _exported = True
+    credentials = boto3.Session().get_credentials()
+    if credentials is None:
+        return
+    frozen = credentials.get_frozen_credentials()
+    os.environ["AWS_ACCESS_KEY_ID"] = frozen.access_key
+    os.environ["AWS_SECRET_ACCESS_KEY"] = frozen.secret_key
+    if frozen.token:
+        os.environ["AWS_SESSION_TOKEN"] = frozen.token
+
+
+_exported = False
+
+
 def session(tables: dict[str, Table], **settings: Any) -> Session:
     """
     A session over `tables`, by name, calling this project's lambdas. `settings` are
@@ -46,6 +72,7 @@ def session(tables: dict[str, Table], **settings: Any) -> Session:
     with how many of a fan-out's invocations have succeeded and how many it
     has: with none before it invokes, then as they arrive.
     """
+    export_credentials()
     return Session(
         {name: _table(table) for name, table in tables.items()}, project=PROJECT, **settings
     )

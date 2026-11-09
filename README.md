@@ -71,11 +71,12 @@ uv run zarr-datafusion-lambda delete    # when you're finished; the bucket and i
 
 Deploy again after any change; the stack remembers the bucket.
 
-The client plans against S3 with credentials from `AWS_*` variables,
-so export as follows:
+The client finds AWS credentials in the same way as the `aws` CLI, so a
+profile, SSO or CloudShell all work, and `AWS_*` variables take precedence.
+The workers are in us-east-1, so the client's region must be too:
 
 ```shell
-eval "$(aws configure export-credentials --format env)"; export AWS_REGION=us-east-1
+export AWS_REGION=us-east-1
 ```
 
 Each benchmark below saves its run to `results/`, with a timeline of its
