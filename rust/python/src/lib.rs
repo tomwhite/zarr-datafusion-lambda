@@ -34,7 +34,6 @@ impl Session {
         dispatchers = None,
         chunks_per_invocation = 1,
         chunks_in_flight = None,
-        allow_cross_region = false,
         return_stats = false,
         target_partitions = None,
         on_progress = None,
@@ -49,7 +48,6 @@ impl Session {
         dispatchers: Option<usize>,
         chunks_per_invocation: usize,
         chunks_in_flight: Option<usize>,
-        allow_cross_region: bool,
         return_stats: bool,
         target_partitions: Option<usize>,
         on_progress: Option<Py<PyAny>>,
@@ -66,7 +64,6 @@ impl Session {
             endpoint_url,
             chunks_per_invocation,
             chunks_in_flight,
-            allow_cross_region,
             return_stats,
             ..Settings::default()
         };

@@ -66,11 +66,11 @@ def session(tables: dict[str, Table], **settings: Any) -> Session:
     `endpoint_url`, for a local `cargo lambda watch`, `concurrency`,
     `dispatchers` (by default the fewest that hold `concurrency`),
     `chunks_per_invocation`, `chunks_in_flight` (how many of those a
-    worker runs at once, by default 2), `allow_cross_region` (else a fan-out
-    over an S3 bucket in another region than the workers is refused before
-    it starts), `return_stats`, `target_partitions` and `on_progress`, called
-    with how many of a fan-out's invocations have succeeded and how many it
-    has: with none before it invokes, then as they arrive.
+    worker runs at once, by default 2), `return_stats`, `target_partitions`
+    and `on_progress`, called with how many of a fan-out's invocations have
+    succeeded and how many it has: with none before it invokes, then as they
+    arrive. A fan-out over an S3 bucket in another region than the workers is
+    refused before it starts.
     """
     export_credentials()
     return Session(
