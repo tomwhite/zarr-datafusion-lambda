@@ -139,6 +139,19 @@ print(f"{result.chunks} chunks in {result.invocations} invocations")
 EOF
 ```
 
+To edit queries and see their plans, `examples/query.ipynb` runs the same
+query in Jupyter. From a release, having downloaded the notebook:
+
+```shell
+uv run --no-project --python 3.12 --with zarr-datafusion-lambda --with jupyterlab --with ipywidgets --with pandas jupyter lab
+```
+
+From a checkout, with the package built from source:
+
+```shell
+uv run --with jupyterlab --with ipywidgets --with pandas jupyter lab examples/query.ipynb
+```
+
 Each benchmark below runs from a checkout, which builds the client from
 source, and saves its run to `results/`, with a timeline of its invocations.
 

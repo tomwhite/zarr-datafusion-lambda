@@ -10,3 +10,4 @@ results/
 .history
 # Written by a release build, for its wheels to carry.
 zarr_datafusion_lambda/*.sha256
+.ipynb_checkpoints/

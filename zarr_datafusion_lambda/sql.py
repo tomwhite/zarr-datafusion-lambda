@@ -12,7 +12,7 @@ from urllib.parse import unquote, urlparse
 
 import boto3
 import pyarrow as pa
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from zarr_datafusion_lambda._native import Session
 from zarr_datafusion_lambda.deploy import PROJECT
