@@ -73,10 +73,23 @@ release](https://github.com/tomwhite/zarr-datafusion-lambda/releases), and
 map-lambda's wheel from its own:
 
 ```shell
-RELEASES="--find-links https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev1 --find-links https://github.com/tomwhite/map-lambda/releases/expanded_assets/v0.1.0.dev1"
-uvx --python 3.12 $RELEASES zarr-datafusion-lambda deploy --allow-bucket <bucket>
-uvx --python 3.12 $RELEASES zarr-datafusion-lambda list      # what is deployed
-uvx --python 3.12 $RELEASES zarr-datafusion-lambda delete    # when you're finished; the bucket and its data stay
+export UV_FIND_LINKS=https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev1,https://github.com/tomwhite/map-lambda/releases/expanded_assets/v0.1.0.dev1
+uvx --python 3.12 zarr-datafusion-lambda deploy --allow-bucket <bucket>
+uvx --python 3.12 zarr-datafusion-lambda list      # what is deployed
+uvx --python 3.12 zarr-datafusion-lambda delete    # when you're finished; the bucket and its data stay
+```
+
+`--python 3.12` is needed where the default Python is older, as it is in
+CloudShell.
+
+The same commands work in [AWS
+CloudShell](https://aws.amazon.com/cloudshell/), which has credentials
+already set, once uv is installed:
+
+```shell
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+export UV_CACHE_DIR=/tmp/uv-cache   # CloudShell's home directory is limited to 1 GB
 ```
 
 ### From source
