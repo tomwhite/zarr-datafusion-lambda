@@ -16,8 +16,9 @@ use datafusion::arrow::array::{AsArray, UInt64Array};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::datatypes::UInt64Type;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::extensions_options;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::config::ConfigOptions;
+use datafusion::config::{ConfigExtension, ConfigOptions};
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
@@ -93,6 +94,19 @@ impl Default for Settings {
 /// many it has: with none before it invokes, then as they arrive.
 pub type OnProgress = Arc<dyn Fn(usize, usize) + Send + Sync>;
 
+extensions_options! {
+    /// The `lambda.` settings, which SQL's `SET` changes for a session.
+    pub struct LambdaOptions {
+        /// Whether a plan that can be cut fans out: `SET lambda.enabled = false`
+        /// runs every plan in this process, as plain zarr-datafusion would.
+        pub enabled: bool, default = true
+    }
+}
+
+impl ConfigExtension for LambdaOptions {
+    const PREFIX: &'static str = "lambda";
+}
+
 /// A map-lambda session and the settings its fan-outs run with.
 pub struct FanOut {
     session: Session,
@@ -139,14 +153,21 @@ impl FanOut {
 /// A session over Zarr tables that fans out through `fan_out`, planning what
 /// runs here for `target_partitions`, or by default for this machine's cores.
 pub fn session(fan_out: Arc<FanOut>, target_partitions: Option<usize>) -> SessionContext {
-    split::session_from(
+    let ctx = split::session_from(
         split::builder()
             .with_physical_optimizer_rule(Arc::new(FanOutRule(fan_out)))
             // After the cut, so it only pushes down aggregates that stay here.
             .with_physical_optimizer_rule(Arc::new(CardinalityRule::new()))
             .with_physical_optimizer_rule(Arc::new(split::PerValueRule)),
         target_partitions,
-    )
+    );
+    ctx.state_ref()
+        .write()
+        .config_mut()
+        .options_mut()
+        .extensions
+        .insert(LambdaOptions::default());
+    ctx
 }
 
 /// A Zarr table's location, and its zarr-datafusion options, such as the
@@ -220,8 +241,15 @@ impl PhysicalOptimizerRule for FanOutRule {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let enabled = config
+            .extensions
+            .get::<LambdaOptions>()
+            .is_none_or(|options| options.enabled);
+        if !enabled {
+            return Ok(plan);
+        }
         plan.transform_up(|node| {
             let exec = match self.cut(&node)? {
                 Some(exec) => Some(exec),

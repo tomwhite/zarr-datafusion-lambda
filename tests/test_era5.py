@@ -264,6 +264,37 @@ def fragments(tables, query):
     return session(tables, **LOCAL).fragments(query)
 
 
+DISABLED = {"lambda.enabled": "false"}
+
+
+def test_with_lambdas_disabled_a_query_runs_here_with_the_same_answer(era5):
+    result = run(QUERIES[0], {"era5": era5}, **LOCAL, config=DISABLED)
+
+    assert result.reports == []
+    rows_close(result.table.to_pylist(), query_locally(era5, QUERIES[0]))
+
+
+def test_set_turns_lambdas_off_and_on_in_a_session(era5_metadata):
+    s = session({"era5": era5_metadata}, **LOCAL)
+
+    s.sql("SET lambda.enabled = false")
+    assert s.fragments(QUERIES[0]) == []
+    s.sql("SET lambda.enabled = true")
+    assert len(s.fragments(QUERIES[0])) == 1
+
+
+def test_explain_with_lambdas_disabled_has_no_fragments(era5_metadata):
+    plan = explain(QUERIES[0], {"era5": era5_metadata}, **LOCAL, config=DISABLED)
+
+    assert "MapLambdaZarrExec" not in plan
+    assert "fragment:" not in plan
+
+
+def test_a_misspelt_lambda_option_is_refused(era5_metadata):
+    with pytest.raises(RuntimeError, match='"enable" not found'):
+        session({"era5": era5_metadata}, **LOCAL, config={"lambda.enable": "false"})
+
+
 def test_a_partial_aggregate_fans_out_one_chunk_per_invocation(era5_metadata):
     [(_, inputs)] = fragments({"era5": era5_metadata}, QUERIES[0])
 
