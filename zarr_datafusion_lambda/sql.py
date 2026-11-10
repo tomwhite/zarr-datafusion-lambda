@@ -66,10 +66,12 @@ def session(tables: dict[str, Table], **settings: Any) -> Session:
     `endpoint_url`, for a local `cargo lambda watch`, `concurrency`,
     `dispatchers` (by default the fewest that hold `concurrency`),
     `chunks_per_invocation`, `chunks_in_flight` (how many of those a
-    worker runs at once, by default 2), `return_stats`, `target_partitions`
-    and `on_progress`, called with how many of a fan-out's invocations have
+    worker runs at once, by default 2), `return_stats`, `target_partitions`,
+    `on_progress`, called with how many of a fan-out's invocations have
     succeeded and how many it has: with none before it invokes, then as they
-    arrive. A fan-out over an S3 bucket in another region than the workers is
+    arrive, and `config`, DataFusion's options by key, such as
+    `{"lambda.enabled": "false"}` to run every query here, as SQL's `SET`
+    would. A fan-out over an S3 bucket in another region than the workers is
     refused before it starts.
     """
     export_credentials()

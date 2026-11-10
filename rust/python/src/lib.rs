@@ -37,6 +37,7 @@ impl Session {
         return_stats = false,
         target_partitions = None,
         on_progress = None,
+        config = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -51,6 +52,7 @@ impl Session {
         return_stats: bool,
         target_partitions: Option<usize>,
         on_progress: Option<Py<PyAny>>,
+        config: Option<BTreeMap<String, String>>,
     ) -> PyResult<Self> {
         let tables = tables
             .into_iter()
@@ -81,6 +83,13 @@ impl Session {
                 }
                 let fan_out = Arc::new(fan_out);
                 let ctx = fanout::session(fan_out, target_partitions);
+                for (key, value) in config.unwrap_or_default() {
+                    ctx.state_ref()
+                        .write()
+                        .config_mut()
+                        .options_mut()
+                        .set(&key, &value)?;
+                }
                 fanout::register(&ctx, &tables).await.map(|_| ctx)
             })
         });
