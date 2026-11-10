@@ -82,7 +82,7 @@ uvx --python 3.12 zarr-datafusion-lambda delete    # when you're finished; the b
 `--python 3.12` is needed where the default Python is older, as it is in
 CloudShell.
 
-The same commands work in [AWS
+The same commands, and the query below, work in [AWS
 CloudShell](https://aws.amazon.com/cloudshell/), which has credentials
 already set, once uv is installed:
 
@@ -113,6 +113,30 @@ The workers are in us-east-1, so the client's region must be too:
 
 ```shell
 export AWS_REGION=us-east-1
+```
+
+With the deployment from a release, and `UV_FIND_LINKS` as above, this
+queries a week of ERA5's 2 m temperature for its daily global mean, from the
+package's `sql` module:
+
+```shell
+uv run --no-project --python 3.12 --with zarr-datafusion-lambda python - <<'EOF'
+from zarr_datafusion_lambda import sql
+
+tables = {"era5": {"url": "s3://earthmover-icechunk-era5/icechunkV2", "group": "single/spatial"}}
+query = """
+SELECT date_trunc('day', CAST(valid_time AS TIMESTAMP))                 AS day,
+       sum(t2m * cos(radians(latitude))) / sum(cos(radians(latitude))) AS mean_t2m
+FROM era5
+WHERE valid_time >= TIMESTAMP '2020-01-01' AND valid_time < TIMESTAMP '2020-01-08'
+GROUP BY 1
+ORDER BY 1
+"""
+result = sql.run(query, tables, progress=True)
+for row in result.table.to_pylist():
+    print(f"{row['day']:%Y-%m-%d}  {row['mean_t2m']:.2f} K")
+print(f"{result.chunks} chunks in {result.invocations} invocations")
+EOF
 ```
 
 Each benchmark below runs from a checkout, which builds the client from
