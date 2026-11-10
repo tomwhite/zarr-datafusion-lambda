@@ -73,10 +73,23 @@ release](https://github.com/tomwhite/zarr-datafusion-lambda/releases), and
 map-lambda's wheel from its own:
 
 ```shell
-RELEASES="--find-links https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev1 --find-links https://github.com/tomwhite/map-lambda/releases/expanded_assets/v0.1.0.dev1"
-uvx --python 3.12 $RELEASES zarr-datafusion-lambda deploy --allow-bucket <bucket>
-uvx --python 3.12 $RELEASES zarr-datafusion-lambda list      # what is deployed
-uvx --python 3.12 $RELEASES zarr-datafusion-lambda delete    # when you're finished; the bucket and its data stay
+export UV_FIND_LINKS=https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev1,https://github.com/tomwhite/map-lambda/releases/expanded_assets/v0.1.0.dev1
+uvx --python 3.12 zarr-datafusion-lambda deploy --allow-bucket <bucket>
+uvx --python 3.12 zarr-datafusion-lambda list      # what is deployed
+uvx --python 3.12 zarr-datafusion-lambda delete    # when you're finished; the bucket and its data stay
+```
+
+`--python 3.12` is needed where the default Python is older, as it is in
+CloudShell.
+
+The same commands, and the query below, work in [AWS
+CloudShell](https://aws.amazon.com/cloudshell/), which has credentials
+already set, once uv is installed:
+
+```shell
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+export UV_CACHE_DIR=/tmp/uv-cache   # CloudShell's home directory is limited to 1 GB
 ```
 
 ### From source
@@ -100,6 +113,43 @@ The workers are in us-east-1, so the client's region must be too:
 
 ```shell
 export AWS_REGION=us-east-1
+```
+
+With the deployment from a release, and `UV_FIND_LINKS` as above, this
+queries a week of ERA5's 2 m temperature for its daily global mean, from the
+package's `sql` module:
+
+```shell
+uv run --no-project --python 3.12 --with zarr-datafusion-lambda python - <<'EOF'
+from zarr_datafusion_lambda import sql
+
+tables = {"era5": {"url": "s3://earthmover-icechunk-era5/icechunkV2", "group": "single/spatial"}}
+query = """
+SELECT date_trunc('day', CAST(valid_time AS TIMESTAMP))                 AS day,
+       sum(t2m * cos(radians(latitude))) / sum(cos(radians(latitude))) AS mean_t2m
+FROM era5
+WHERE valid_time >= TIMESTAMP '2020-01-01' AND valid_time < TIMESTAMP '2020-01-08'
+GROUP BY 1
+ORDER BY 1
+"""
+result = sql.run(query, tables, progress=True)
+for row in result.table.to_pylist():
+    print(f"{row['day']:%Y-%m-%d}  {row['mean_t2m']:.2f} K")
+print(f"{result.chunks} chunks in {result.invocations} invocations")
+EOF
+```
+
+To edit queries and see their plans, `examples/query.ipynb` runs the same
+query in Jupyter. From a release, having downloaded the notebook:
+
+```shell
+uv run --no-project --python 3.12 --with zarr-datafusion-lambda --with jupyterlab --with ipywidgets --with pandas jupyter lab
+```
+
+From a checkout, with the package built from source:
+
+```shell
+uv run --with jupyterlab --with ipywidgets --with pandas jupyter lab examples/query.ipynb
 ```
 
 Each benchmark below runs from a checkout, which builds the client from
