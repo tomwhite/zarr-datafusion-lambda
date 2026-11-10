@@ -138,11 +138,6 @@ def print_problems(rows: list[dict[str, Any]], problems: list[str]) -> None:
 @click.option("--chunks-per-invocation", default=24, show_default=True)
 @click.option("--chunks-in-flight", type=int)
 @click.option("--local", is_flag=True, help=f"Against {LOCAL_ENDPOINT_URL}, with no CloudWatch.")
-@click.option(
-    "--allow-cross-region",
-    is_flag=True,
-    help="Read a bucket in another region than the workers, billed per GB.",
-)
 @click.option("--explain", is_flag=True, help="Print the plan and the workers' fragment, and stop.")
 @click.option(
     "--report",
@@ -159,7 +154,6 @@ def main(
     chunks_per_invocation: int,
     chunks_in_flight: int | None,
     local: bool,
-    allow_cross_region: bool,
     explain: bool,
     report: Path | None,
 ) -> None:
@@ -179,7 +173,6 @@ def main(
         "dispatchers": dispatchers,
         "chunks_per_invocation": chunks_per_invocation,
         "chunks_in_flight": chunks_in_flight,
-        "allow_cross_region": allow_cross_region,
     }
     if explain:
         click.echo(sql.explain(query, tables, **settings))

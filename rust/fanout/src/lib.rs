@@ -69,9 +69,6 @@ pub struct Settings {
     pub chunks_per_invocation: usize,
     /// How many of an invocation's chunks a worker runs at once, else its default.
     pub chunks_in_flight: Option<usize>,
-    /// Fan out over S3 buckets in other regions than the workers, which is
-    /// billed per GB read.
-    pub allow_cross_region: bool,
     /// Keep every invocation's record and what its worker measured in the [`Report`].
     pub return_stats: bool,
 }
@@ -87,7 +84,6 @@ impl Default for Settings {
             endpoint_url: None,
             chunks_per_invocation: 1,
             chunks_in_flight: None,
-            allow_cross_region: false,
             return_stats: false,
         }
     }
@@ -757,7 +753,7 @@ impl ExecutionPlan for MapLambdaZarrExec {
         }
 
         let settings = &self.fan_out.settings;
-        let locations = if settings.allow_cross_region || settings.endpoint_url.is_some() {
+        let locations = if settings.endpoint_url.is_some() {
             vec![]
         } else {
             split::zarr_scans(&self.plan)?

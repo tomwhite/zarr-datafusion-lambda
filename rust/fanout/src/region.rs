@@ -1,6 +1,6 @@
 //! Refusing to fan out over a bucket in another region than the workers:
-//! reading across regions is billed per GB, about $0.02, more than the query
-//! itself.
+//! reading across regions is slower, and billed per GB, about $0.02, many
+//! times the query itself.
 
 use std::collections::HashMap;
 
@@ -15,9 +15,9 @@ use url::Url;
 pub fn problem(bucket: &str, region: &str, workers: &str) -> Option<String> {
     (region != workers).then(|| {
         format!(
-            "s3://{bucket} is in {region} but the workers are in {workers}, and reading \
-             across regions costs about $0.02 a GB: run the workers in {region}, or allow \
-             cross-region reads"
+            "s3://{bucket} is in {region} but this client's region is {workers}, where it \
+             invokes the workers: set AWS_REGION={region} and ensure the workers are \
+             deployed there"
         )
     })
 }
@@ -75,7 +75,7 @@ mod tests {
     fn a_bucket_in_another_region_is_a_problem() {
         assert!(problem("b", "us-east-1", "eu-west-1")
             .unwrap()
-            .contains("us-east-1"));
+            .contains("set AWS_REGION=us-east-1"));
         assert_eq!(problem("b", "eu-west-1", "eu-west-1"), None);
     }
 
