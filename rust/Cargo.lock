@@ -2246,6 +2246,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dispatcher-partial-reduce"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "base64 0.22.1",
+ "datafusion",
+ "lambda_runtime",
+ "map-lambda-combiner",
+ "map-lambda-dispatcher",
+ "serde",
+ "serde_json",
+ "split",
+ "tokio",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3623,8 +3639,8 @@ dependencies = [
 
 [[package]]
 name = "map-lambda-client"
-version = "0.1.0"
-source = "git+https://github.com/tomwhite/map-lambda?tag=v0.1.0#f383603bf9b11980a7aabc2e333d822775a6ca30"
+version = "0.2.0"
+source = "git+https://github.com/tomwhite/map-lambda?tag=v0.2.0#404b442209634501bb73a8a24491fd74a29ee072"
 dependencies = [
  "async-stream",
  "aws-config",
@@ -3639,9 +3655,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "map-lambda-combiner"
+version = "0.2.0"
+source = "git+https://github.com/tomwhite/map-lambda?tag=v0.2.0#404b442209634501bb73a8a24491fd74a29ee072"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "map-lambda-dispatcher"
-version = "0.1.0"
-source = "git+https://github.com/tomwhite/map-lambda?tag=v0.1.0#f383603bf9b11980a7aabc2e333d822775a6ca30"
+version = "0.2.0"
+source = "git+https://github.com/tomwhite/map-lambda?tag=v0.2.0#404b442209634501bb73a8a24491fd74a29ee072"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -3651,6 +3676,7 @@ dependencies = [
  "fastrand",
  "futures",
  "lambda_runtime",
+ "map-lambda-combiner",
  "map-lambda-protocol",
  "serde",
  "serde_json",
@@ -3659,8 +3685,8 @@ dependencies = [
 
 [[package]]
 name = "map-lambda-protocol"
-version = "0.1.0"
-source = "git+https://github.com/tomwhite/map-lambda?tag=v0.1.0#f383603bf9b11980a7aabc2e333d822775a6ca30"
+version = "0.2.0"
+source = "git+https://github.com/tomwhite/map-lambda?tag=v0.2.0#404b442209634501bb73a8a24491fd74a29ee072"
 dependencies = [
  "serde",
  "serde_json",

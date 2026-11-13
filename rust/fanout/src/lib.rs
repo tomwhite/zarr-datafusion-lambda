@@ -42,8 +42,9 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use map_lambda_client::{connect, Invoker, Session};
+use map_lambda_client::{connect, Batch, Combine, CombineBatch, Invoker, Session};
 use serde::Serialize;
+use serde_json::value::RawValue;
 use serde_json::{json, Map, Value};
 use split::PartitionSpec;
 use zarr_datafusion::optimizer::CardinalityRule;
@@ -100,6 +101,12 @@ extensions_options! {
         /// Whether a plan that can be cut fans out: `SET lambda.enabled = false`
         /// runs every plan in this process, as plain zarr-datafusion would.
         pub enabled: bool, default = true
+        /// Whether each dispatcher merges its workers' partial rows into one
+        /// a group before they reach this process, through a dispatcher
+        /// built with the `partial-reduce` combiner. Without it, every
+        /// worker's rows stream back, which Lambda holds to 2 MB/s a
+        /// dispatcher after its first 6 MB.
+        pub combine: bool, default = true
     }
 }
 
@@ -243,15 +250,13 @@ impl PhysicalOptimizerRule for FanOutRule {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let enabled = config
-            .extensions
-            .get::<LambdaOptions>()
-            .is_none_or(|options| options.enabled);
-        if !enabled {
+        let options = config.extensions.get::<LambdaOptions>();
+        if !options.is_none_or(|options| options.enabled) {
             return Ok(plan);
         }
+        let combine = options.is_none_or(|options| options.combine);
         plan.transform_up(|node| {
-            let exec = match self.cut(&node)? {
+            let exec = match self.cut(&node, combine)? {
                 Some(exec) => Some(exec),
                 None => match finish(&node)? {
                     Some(exec) => Some(exec),
@@ -276,7 +281,11 @@ impl PhysicalOptimizerRule for FanOutRule {
 }
 
 impl FanOutRule {
-    fn cut(&self, node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    fn cut(
+        &self,
+        node: &Arc<dyn ExecutionPlan>,
+        combine: bool,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let Some(partial) = node
             .downcast_ref::<AggregateExec>()
             .filter(|a| *a.mode() == AggregateMode::Partial)
@@ -296,12 +305,16 @@ impl FanOutRule {
             let runs = chunks.chunks(per_invocation).map(<[_]>::to_vec).collect();
             (runs, false)
         };
-        Ok(Some(Arc::new(MapLambdaZarrExec::new(
+        let mut exec = MapLambdaZarrExec::new(
             without_round_robin(node.clone())?,
             runs,
             whole_groups,
             self.0.clone(),
-        )?)))
+        )?;
+        if combine {
+            exec.reduce = split::encode_reduce(&exec.plan)?;
+        }
+        Ok(Some(Arc::new(exec)))
     }
 }
 
@@ -582,7 +595,9 @@ pub struct Report {
     /// With `return_stats`: each invocation's record, as map-lambda keeps it.
     pub invocation_stats: Vec<Value>,
     /// With `return_stats`: each worker's `index`, `timings_ms`,
-    /// `s3_requests` and `chunks_in_flight`.
+    /// `s3_requests` and `chunks_in_flight`; or with a combine, each
+    /// state's `indexes`, with its workers' `timings_ms` and `s3_requests`
+    /// summed.
     pub workers: Vec<Value>,
     /// Each dispatcher's record.
     pub dispatcher_stats: Vec<Value>,
@@ -603,6 +618,8 @@ pub struct MapLambdaZarrExec {
     whole_groups: bool,
     /// Whether the fragment ends in the final aggregate.
     finished: bool,
+    /// What the dispatchers merge the workers' partial rows with, if they do.
+    reduce: Option<String>,
     fan_out: Arc<FanOut>,
     properties: Arc<PlanProperties>,
     report: Arc<Mutex<Report>>,
@@ -630,6 +647,7 @@ impl MapLambdaZarrExec {
             runs,
             whole_groups,
             finished: false,
+            reduce: None,
             fan_out,
             properties,
             report: Default::default(),
@@ -717,14 +735,21 @@ impl DisplayAs for MapLambdaZarrExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         let function = &self.fan_out.settings.worker_function;
         let (chunks, invocations) = (self.chunks(), self.runs.len());
+        let combiner = if self.reduce.is_some() {
+            split::COMBINER
+        } else {
+            "none"
+        };
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 f,
-                "MapLambdaZarrExec: function={function}, chunks={chunks}, invocations={invocations}",
+                "MapLambdaZarrExec: function={function}, chunks={chunks}, \
+                 invocations={invocations}, combiner={combiner}",
             ),
             DisplayFormatType::TreeRender => write!(
                 f,
-                "function={function}\nchunks={chunks}\ninvocations={invocations}",
+                "function={function}\nchunks={chunks}\ninvocations={invocations}\n\
+                 combiner={combiner}",
             ),
         }
     }
@@ -736,6 +761,46 @@ fn external(e: impl std::error::Error + Send + Sync + 'static) -> DataFusionErro
 
 fn to_value(record: &impl Serialize) -> Value {
     serde_json::to_value(record).expect("records serialize")
+}
+
+/// What arrived from the dispatchers at once: each response with the
+/// inputs it answers, a worker's output for one, or a state for those its
+/// dispatcher merged.
+struct Arrival {
+    succeeded: usize,
+    responses: Vec<(Vec<usize>, Box<RawValue>)>,
+    invocation_stats: Vec<Value>,
+    dispatcher_stats: Vec<Value>,
+}
+
+impl From<Batch> for Arrival {
+    fn from(batch: Batch) -> Self {
+        Self {
+            succeeded: batch.succeeded,
+            responses: batch
+                .outputs
+                .into_iter()
+                .map(|(index, output)| (vec![index], output))
+                .collect(),
+            invocation_stats: batch.invocation_stats.iter().map(to_value).collect(),
+            dispatcher_stats: batch.dispatcher_stats.iter().map(to_value).collect(),
+        }
+    }
+}
+
+impl From<CombineBatch> for Arrival {
+    fn from(batch: CombineBatch) -> Self {
+        Self {
+            succeeded: batch.succeeded,
+            responses: batch
+                .states
+                .into_iter()
+                .map(|state| (state.indexes, state.state))
+                .collect(),
+            invocation_stats: batch.invocation_stats.iter().map(to_value).collect(),
+            dispatcher_stats: batch.dispatcher_stats.iter().map(to_value).collect(),
+        }
+    }
 }
 
 fn decode(output: &Value) -> Result<Vec<RecordBatch>> {
@@ -791,6 +856,11 @@ impl ExecutionPlan for MapLambdaZarrExec {
                 .collect()
         };
         let (fan_out, template) = (self.fan_out.clone(), self.template());
+        let combine = self.reduce.clone().map(|plan| Combine {
+            combiner: split::COMBINER.into(),
+            config: json!({ "plan": plan }),
+        });
+        let combined = combine.is_some();
         let on_progress = self.fan_out.on_progress.clone();
         let total = inputs.len();
         // The workers each write their own chunks to a store made here first.
@@ -810,14 +880,20 @@ impl ExecutionPlan for MapLambdaZarrExec {
             if let Some(on_progress) = &on_progress {
                 on_progress(0, total);
             }
-            let worker = &fan_out.settings.worker_function;
-            Ok::<_, DataFusionError>(
-                fan_out
-                    .session
+            let (session, worker) = (&fan_out.session, &fan_out.settings.worker_function);
+            let arrivals = match combine {
+                None => session
                     .map_unordered(worker, inputs, "partitions", template)
                     .map_err(external)?
-                    .map_err(external),
-            )
+                    .map_ok(Arrival::from)
+                    .boxed(),
+                Some(combine) => session
+                    .map_combine(worker, inputs, "partitions", template, combine)
+                    .map_err(external)?
+                    .map_ok(Arrival::from)
+                    .boxed(),
+            };
+            Ok::<_, DataFusionError>(arrivals.map_err(external))
         })
         .try_flatten();
         let report = self.report.clone();
@@ -826,47 +902,54 @@ impl ExecutionPlan for MapLambdaZarrExec {
         let mut succeeded = 0;
         let started = Instant::now();
         let batches = run
-            .and_then(move |batch| {
-                if let (Some(on_progress), 1..) = (&on_progress, batch.succeeded) {
-                    succeeded += batch.succeeded;
+            .and_then(move |arrival| {
+                if let (Some(on_progress), 1..) = (&on_progress, arrival.succeeded) {
+                    succeeded += arrival.succeeded;
                     on_progress(succeeded, total);
                 }
-                let decoded = batch
-                    .outputs
-                    .iter()
-                    .map(|(index, output)| {
-                        let output: Value = serde_json::from_str(output.get()).map_err(external)?;
-                        Ok((*index, output))
+                let decoded = arrival
+                    .responses
+                    .into_iter()
+                    .map(|(indexes, response)| {
+                        let response: Value =
+                            serde_json::from_str(response.get()).map_err(external)?;
+                        Ok((indexes, response))
                     })
                     .collect::<Result<Vec<_>>>()
-                    .and_then(|outputs| {
+                    .and_then(|responses| {
                         let mut report = report.lock().expect("unpoisoned");
                         report.elapsed_s = started.elapsed().as_secs_f64();
-                        report
-                            .dispatcher_stats
-                            .extend(batch.dispatcher_stats.iter().map(to_value));
+                        report.dispatcher_stats.extend(arrival.dispatcher_stats);
                         if return_stats {
-                            let bytes: usize = outputs
+                            let bytes: usize = responses
                                 .iter()
-                                .map(|(_, output)| output["batches"].as_str().map_or(0, str::len))
+                                .map(|(_, response)| {
+                                    response["batches"].as_str().map_or(0, str::len)
+                                })
                                 .sum();
                             let at_s = report.elapsed_s;
                             report.arrivals.push(json!({"at_s": at_s, "bytes": bytes}));
+                            report.invocation_stats.extend(arrival.invocation_stats);
                             report
-                                .invocation_stats
-                                .extend(batch.invocation_stats.iter().map(to_value));
-                            report.workers.extend(outputs.iter().map(|(index, output)| {
-                                json!({
-                                    "index": index,
-                                    "timings_ms": output["timings_ms"],
-                                    "s3_requests": output["s3_requests"],
-                                    "chunks_in_flight": output["chunks_in_flight"],
-                                })
-                            }));
+                                .workers
+                                .extend(responses.iter().map(|(indexes, response)| {
+                                    let mut worker = json!({
+                                        "timings_ms": response["timings_ms"],
+                                        "s3_requests": response["s3_requests"],
+                                    });
+                                    if combined {
+                                        worker["indexes"] = json!(indexes);
+                                    } else {
+                                        worker["index"] = json!(indexes[0]);
+                                        worker["chunks_in_flight"] =
+                                            response["chunks_in_flight"].clone();
+                                    }
+                                    worker
+                                }));
                         }
-                        outputs
+                        responses
                             .iter()
-                            .map(|(_, output)| decode(output))
+                            .map(|(_, response)| decode(response))
                             .collect::<Result<Vec<_>>>()
                     })
                     .map(|batches| futures::stream::iter(batches.into_iter().flatten().map(Ok)));

@@ -11,6 +11,8 @@ from map_lambda import LOCAL_ENDPOINT_URL
 from zarr_datafusion_lambda.sql import explain, location, run, session
 
 LOCAL = {"endpoint_url": LOCAL_ENDPOINT_URL, "concurrency": 100}
+# for what each worker measured, which a combine sums
+UNCOMBINED = {"lambda.combine": "false"}
 
 VARIABLE = "t2m"
 DIMS = ("time", "latitude", "longitude")
@@ -149,9 +151,11 @@ def rows_close(actual, expected):
 
 
 @pytest.mark.lambda_integration
+@pytest.mark.parametrize("combine", ["true", "false"])
 @pytest.mark.parametrize("query", [*WINDOWED.values(), *QUERIES])
-def test_queries_match_one_process(era5, query):
-    result = run(query, {"era5": era5}, **LOCAL, chunks_per_invocation=7)
+def test_queries_match_one_process(era5, query, combine):
+    config = {"lambda.combine": combine}
+    result = run(query, {"era5": era5}, **LOCAL, chunks_per_invocation=7, config=config)
 
     assert result.chunks
     rows_close(result.table.to_pylist(), query_locally(era5, query))
@@ -159,7 +163,14 @@ def test_queries_match_one_process(era5, query):
 
 @pytest.mark.lambda_integration
 def test_every_invocation_has_its_workers_measurements(era5):
-    result = run(QUERIES[0], {"era5": era5}, **LOCAL, chunks_per_invocation=7, return_stats=True)
+    result = run(
+        QUERIES[0],
+        {"era5": era5},
+        **LOCAL,
+        chunks_per_invocation=7,
+        return_stats=True,
+        config=UNCOMBINED,
+    )
 
     [report] = result.reports
     indexes = sorted(r["index"] for r in report["invocation_stats"])
@@ -167,6 +178,19 @@ def test_every_invocation_has_its_workers_measurements(era5):
     assert sorted(w["index"] for w in report["workers"]) == indexes
     # a local store isn't counted
     assert all(w["s3_requests"] == {"gets": 0, "lists": 0} for w in report["workers"])
+
+
+@pytest.mark.lambda_integration
+def test_each_dispatcher_merges_its_workers_into_one_state(era5):
+    result = run(QUERIES[0], {"era5": era5}, **LOCAL, dispatchers=3, return_stats=True)
+
+    [report] = result.reports
+    states = report["workers"]
+    assert len(states) == 3
+    covered = sorted(i for state in states for i in state["indexes"])
+    assert covered == list(range(result.invocations))
+    assert all(s["s3_requests"] == {"gets": 0, "lists": 0} for s in states)
+    assert all(s["timings_ms"]["execute"] > 0 for s in states)
 
 
 @pytest.mark.lambda_integration
@@ -214,6 +238,7 @@ def test_chunks_in_flight_give_the_same_answer(era5, in_flight):
         chunks_per_invocation=7,
         chunks_in_flight=in_flight,
         return_stats=True,
+        config=UNCOMBINED,
     )
 
     [report] = result.reports
@@ -288,6 +313,13 @@ def test_explain_with_lambdas_disabled_has_no_fragments(era5_metadata):
 
     assert "MapLambdaZarrExec" not in plan
     assert "fragment:" not in plan
+
+
+def test_a_fan_out_combines_unless_set_not_to(era5_metadata):
+    tables = {"era5": era5_metadata}
+
+    assert "combiner=partial-reduce" in explain(QUERIES[0], tables, **LOCAL)
+    assert "combiner=none" in explain(QUERIES[0], tables, **LOCAL, config=UNCOMBINED)
 
 
 def test_a_misspelt_lambda_option_is_refused(era5_metadata):
@@ -428,6 +460,7 @@ def test_the_final_aggregate_runs_on_the_workers_when_each_tile_takes_one_invoca
 
     assert ("AggregateExec: mode=Final," in fragment) == on_the_workers
     assert ("mode=FinalPartitioned" in plan) != on_the_workers
+    assert ("combiner=partial-reduce" in plan) != on_the_workers
 
 
 def test_a_filtered_inner_axis_is_not_cut(tmp_path):

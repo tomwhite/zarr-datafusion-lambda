@@ -35,20 +35,26 @@ pub fn merge_partials(
     if *partial.mode() != AggregateMode::Partial {
         return Ok(coalesced);
     }
+    Ok(partial_reduce(partial, coalesced.clone())?.unwrap_or(coalesced))
+}
+
+/// The partial rows of `partial`, read from `states`, merged to one a group,
+/// if that keeps `partial`'s schema, so that the rows merged can be merged
+/// again.
+pub fn partial_reduce(
+    partial: &AggregateExec,
+    states: Arc<dyn ExecutionPlan>,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     // as DataFusion's planner builds the stage above a partial aggregate
     let merged = AggregateExec::try_new(
         AggregateMode::PartialReduce,
         partial.group_expr().as_final(),
         partial.aggr_expr().to_vec(),
         partial.filter_expr().to_vec(),
-        coalesced.clone(),
+        states,
         partial.input_schema(),
     )?;
-    Ok(if merged.schema() == plan.schema() {
-        Arc::new(merged)
-    } else {
-        coalesced
-    })
+    Ok((merged.schema() == partial.schema()).then(|| Arc::new(merged) as _))
 }
 
 fn ends_in_an_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
@@ -57,7 +63,7 @@ fn ends_in_an_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use arrow::array::{Float64Array, Int64Array};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
@@ -68,7 +74,7 @@ mod tests {
     use super::*;
 
     /// Three partitions, each holding every one of the keys 0 to 3.
-    async fn context() -> SessionContext {
+    pub(crate) async fn context() -> SessionContext {
         let partitions = (0..3)
             .map(|p| {
                 let k = Int64Array::from_iter_values((0..12).map(|i| i % 4));
@@ -85,7 +91,9 @@ mod tests {
         ctx
     }
 
-    fn partial_aggregate(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    pub(crate) fn partial_aggregate(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
         if plan
             .downcast_ref::<AggregateExec>()
             .is_some_and(|a| *a.mode() == AggregateMode::Partial)
@@ -133,20 +141,21 @@ mod tests {
             .unwrap(),
         );
         let actual = collect(finished, ctx.task_ctx()).await.unwrap();
-        // the rows alone: the query's projection renames the columns
-        let sorted = |batches: &[RecordBatch]| {
-            let mut lines = arrow::util::pretty::pretty_format_batches(batches)
-                .unwrap()
-                .to_string()
-                .lines()
-                .skip(3)
-                .filter(|line| !line.starts_with('+'))
-                .map(|line| line.split('|').map(str::trim).collect::<Vec<_>>().join("|"))
-                .collect::<Vec<_>>();
-            lines.sort();
-            lines.join("\n")
-        };
-        (sorted(&actual), sorted(&expected), rows)
+        (sorted_rows(&actual), sorted_rows(&expected), rows)
+    }
+
+    /// The rows alone, sorted: a query's projection renames the columns.
+    pub(crate) fn sorted_rows(batches: &[RecordBatch]) -> String {
+        let mut lines = arrow::util::pretty::pretty_format_batches(batches)
+            .unwrap()
+            .to_string()
+            .lines()
+            .skip(3)
+            .filter(|line| !line.starts_with('+'))
+            .map(|line| line.split('|').map(str::trim).collect::<Vec<_>>().join("|"))
+            .collect::<Vec<_>>();
+        lines.sort();
+        lines.join("\n")
     }
 
     #[tokio::test]
@@ -201,20 +210,8 @@ mod tests {
         assert!(merged.children()[0]
             .downcast_ref::<AggregateExec>()
             .is_some_and(|a| *a.mode() == AggregateMode::PartialReduce));
-        let rows = |batches: &[RecordBatch]| {
-            let mut lines: Vec<_> = arrow::util::pretty::pretty_format_batches(batches)
-                .unwrap()
-                .to_string()
-                .lines()
-                .skip(3)
-                .filter(|line| !line.starts_with('+'))
-                .map(|line| line.split('|').map(str::trim).collect::<Vec<_>>().join("|"))
-                .collect();
-            lines.sort();
-            lines
-        };
         let actual = collect(merged, ctx.task_ctx()).await.unwrap();
-        assert_eq!(rows(&actual), rows(&expected));
+        assert_eq!(sorted_rows(&actual), sorted_rows(&expected));
     }
 
     #[tokio::test]
