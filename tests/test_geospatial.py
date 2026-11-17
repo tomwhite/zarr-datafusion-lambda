@@ -38,8 +38,8 @@ MAP = "no aggregate: rows"
 @dataclass(frozen=True)
 class Case:
     query: str
-    # sorted, as `cut` gives them
-    cut: tuple[str, ...] = ()
+    # sorted, as `cut` gives them; `None` if it can't be cut, so is refused
+    cut: tuple[str, ...] | None = None
     reference: Callable[[xr.Dataset], list[dict]] | None = None
     chunks: tuple[int, int, int] = CHUNKS
     chunks_per_invocation: int = 7
@@ -272,15 +272,17 @@ CASES = {
         chunks=PENCILS,
         chunks_per_invocation=SHAPE[0] // PENCILS[0],
     ),
-    "derived-variable": Case(DERIVED_VARIABLE, (), derived_variable, variables=SURFACE),
-    "anomaly": Case(ANOMALY, (PARTIAL,), anomaly),
-    "persistence-skill": Case(PERSISTENCE_SKILL, (), persistence_skill),
+    "derived-variable": Case(DERIVED_VARIABLE, None, derived_variable, variables=SURFACE),
+    "anomaly": Case(ANOMALY, None, anomaly),
+    "persistence-skill": Case(PERSISTENCE_SKILL, None, persistence_skill),
     "region-statistics": Case(REGION_STATISTICS, (PARTIAL,), region_statistics),
     "reprojection": Case(REPROJECTION),
-    "regridding": Case(REGRIDDING, (), regridding, weights=True),
+    "regridding": Case(REGRIDDING, None, regridding, weights=True),
 }
 CHECKED = [name for name, case in CASES.items() if case.reference]
 UNCHECKED = [name for name, case in CASES.items() if not case.reference]
+CUT = [name for name in CHECKED if CASES[name].cut is not None]
+REFUSED = [name for name in CHECKED if CASES[name].cut is None]
 
 # What stops a case running in the client.
 GAPS = {
@@ -327,12 +329,12 @@ def reference(tmp_path, case):
 
 @pytest.mark.lambda_integration
 @pytest.mark.parametrize("combine", ["true", "false"])
-@pytest.mark.parametrize("name", CHECKED)
+@pytest.mark.parametrize("name", CUT)
 def test_a_case_with_lambdas_matches_xarray(tmp_path, name, combine):
     case = CASES[name]
     result = answer(tmp_path, case, config={"lambda.combine": combine})
 
-    assert bool(result.chunks) == bool(case.cut)
+    assert result.chunks
     rows_close(result.table.to_pylist(), reference(tmp_path, case))
 
 
@@ -370,11 +372,17 @@ def cut(tmp_path, case):
     return kinds
 
 
-@pytest.mark.parametrize("name", CHECKED)
+@pytest.mark.parametrize("name", CUT)
 def test_a_case_is_cut_where_expected(tmp_path, name):
     case = CASES[name]
 
     assert cut(tmp_path, case) == case.cut
+
+
+@pytest.mark.parametrize("name", REFUSED)
+def test_a_case_that_cant_be_cut_is_refused(tmp_path, name):
+    with pytest.raises(RuntimeError, match="can't run on the workers"):
+        cut(tmp_path, CASES[name])
 
 
 # How each case should be cut, and what that needs.

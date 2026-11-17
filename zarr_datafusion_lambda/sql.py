@@ -1,7 +1,8 @@
 """
 SQL over Zarr tables. Each partial aggregate over a chunkwise Zarr scan runs on
 `fragment` lambdas, a run of chunks each, and the rest of the query here. A
-query with nothing to fan out runs here entirely.
+query that would scan or write Zarr here is refused, with why, unless
+`lambda.enabled` is false, which runs all of it here.
 """
 
 import json
@@ -85,7 +86,7 @@ def session(tables: dict[str, Table], **settings: Any) -> Session:
 class Result:
     table: pa.Table
     reports: list[dict[str, Any]]
-    """What each fan-out did: none when the query ran in this process."""
+    """What each fan-out did: none when the query read no chunks, or ran here."""
 
     @property
     def chunks(self) -> int | None:

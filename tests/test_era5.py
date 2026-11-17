@@ -376,18 +376,16 @@ def test_a_group_key_without_the_tiles_axes_is_dealt_in_listing_order(tmp_path):
     [GLOBAL_CLIMATOLOGY, GLOBAL_CLIMATOLOGY.replace("FROM era5\n", f"FROM era5\nWHERE {WINDOW}\n")],
     ids=["all-time", "windowed"],
 )
-@pytest.mark.parametrize(("chunks", "on_the_workers"), [("24,5,6", True), ("24,10,6", False)])
 def test_a_zarr_copy_of_the_climatology_over_pencils_matches_one_process(
-    era5_pencils, tmp_path, climatology, chunks, on_the_workers
+    era5_pencils, tmp_path, climatology
 ):
     out = tmp_path / "climatology.zarr"
-    query = f"COPY ({climatology}) TO '{out}' STORED AS ZARR OPTIONS ('chunks' '{chunks}')"
+    query = f"COPY ({climatology}) TO '{out}' STORED AS ZARR OPTIONS ('chunks' '24,5,6')"
     tables = {"era5": era5_pencils}
     settings = {**LOCAL, "chunks_per_invocation": SHAPE[0] // PENCILS[0]}
 
-    # a chunk of 10 latitudes spans two tiles, so the store is written here
     [fragment] = session(tables, **settings).explain_fragments(query)
-    assert ("ZarrDataSink" in fragment) == on_the_workers
+    assert "ZarrDataSink" in fragment
     result = run(query, tables, **settings)
 
     expected = query_locally(era5_pencils, climatology)
@@ -434,6 +432,17 @@ def test_the_final_aggregate_runs_on_the_workers_when_the_key_holds_the_outer_co
     assert ("AggregateExec: mode=Final," in fragment) == on_the_workers
 
 
+def test_a_zarr_copy_whose_chunks_span_tiles_is_refused(tmp_path):
+    write_group(tmp_path / "era5", with_values=False, chunks=PENCILS)
+    out = tmp_path / "climatology.zarr"
+    # a chunk of 10 latitudes spans two tiles of 5
+    query = f"COPY ({GLOBAL_CLIMATOLOGY}) TO '{out}' STORED AS ZARR OPTIONS ('chunks' '24,10,6')"
+    settings = {**LOCAL, "chunks_per_invocation": SHAPE[0] // PENCILS[0]}
+
+    with pytest.raises(RuntimeError, match="two workers would write one"):
+        session({"era5": (tmp_path / "era5").as_uri()}, **settings).explain_fragments(query)
+
+
 @pytest.mark.parametrize(("chunks_per_invocation", "on_the_workers"), [(6, True), (4, False)])
 def test_the_final_aggregate_runs_on_the_workers_when_each_tile_takes_one_invocation(
     tmp_path, chunks_per_invocation, on_the_workers
@@ -471,22 +480,29 @@ def test_a_fragment_runs_one_partition_per_chunk_whatever_the_clients_cores(era5
 @pytest.mark.parametrize(
     ("query", "why"),
     [
-        (SELF_JOIN, "two scans, joined across chunks"),
-        ("SELECT t2m FROM era5 LIMIT 3", "no aggregate"),
+        (SELF_JOIN, "two Zarr scans are joined"),
+        ("SELECT t2m FROM era5 LIMIT 3", "can't be split into chunks"),
         (
             "SELECT max(r) AS r FROM (SELECT row_number() OVER (ORDER BY time) AS r FROM era5)",
-            "a window over the whole table",
+            "don't work chunk by chunk: .*BoundedWindowAggExec",
         ),
         (
             "SELECT count(*) AS n FROM (SELECT t2m FROM era5 LIMIT 100)",
-            "a limit over the whole table",
+            "can't be split into chunks",
         ),
     ],
 )
-def test_a_query_whose_aggregate_doesnt_work_chunk_by_chunk_doesnt_fan_out(
-    era5_metadata, query, why
-):
-    assert fragments({"era5": era5_metadata}, query) == [], why
+def test_a_query_that_cant_be_cut_by_chunk_is_refused(era5_metadata, query, why):
+    with pytest.raises(RuntimeError, match=why):
+        fragments({"era5": era5_metadata}, query)
+
+
+def test_a_count_from_metadata_reads_no_chunks(era5):
+    query = "SELECT count(*) AS n FROM era5"
+    result = run(query, {"era5": era5}, **LOCAL)
+
+    assert result.chunks is None
+    rows_close(result.table.to_pylist(), query_locally(era5, query))
 
 
 REGIONS = REGIONS_SQL.replace("AS regions(", "AS r(")
@@ -510,15 +526,14 @@ def test_a_join_with_a_small_table_fans_out_with_the_table_in_the_fragment(era5_
 @pytest.mark.parametrize(
     ("joined", "why"),
     [
-        (f"era5 a JOIN {REGIONS} ON {IN_REGION}", "the scan written first is the build side"),
-        (
-            f"{REGIONS} LEFT JOIN era5 a ON {IN_REGION}",
-            "every worker would add the regions none of its rows fall in",
-        ),
-        (f"big r JOIN era5 a ON {IN_REGION}", "the table is too big to send every worker"),
+        (f"era5 a JOIN {REGIONS} ON {IN_REGION}", "build side: write the smaller side first"),
+        # every worker would add the regions none of its rows fall in
+        (f"{REGIONS} LEFT JOIN era5 a ON {IN_REGION}", "can't be sent to every worker"),
+        # too big to send every worker
+        (f"big r JOIN era5 a ON {IN_REGION}", "can't be sent to every worker"),
     ],
 )
-def test_a_join_that_cant_be_broadcast_doesnt_fan_out(era5_metadata, joined, why):
+def test_a_join_that_cant_be_broadcast_is_refused(era5_metadata, joined, why):
     s = session({"era5": era5_metadata}, **LOCAL)
     # 1.6 MB as two float64 columns
     s.sql(
@@ -527,7 +542,8 @@ def test_a_join_that_cant_be_broadcast_doesnt_fan_out(era5_metadata, joined, why
         "CAST(value AS VARCHAR) AS region FROM generate_series(1, 100000)"
     )
 
-    assert s.fragments(by_region(joined)) == [], why
+    with pytest.raises(RuntimeError, match=why):
+        s.fragments(by_region(joined))
 
 
 # TODO: CAST(time AS TIMESTAMP) because zarr-datafusion's time is UTC, and the
@@ -535,16 +551,13 @@ def test_a_join_that_cant_be_broadcast_doesnt_fan_out(era5_metadata, joined, why
 UNSPLITTABLE = [
     "SELECT CAST(time AS TIMESTAMP) AS time, latitude, longitude, t2m FROM era5 "
     "ORDER BY time, latitude, longitude LIMIT 5",
-    # answered from statistics, so there is no scan to distribute
-    "SELECT count(*) AS n FROM era5",
     SELF_JOIN,
 ]
 
 
-@pytest.mark.lambda_integration
 @pytest.mark.parametrize("query", UNSPLITTABLE)
-def test_a_query_that_cant_be_split_runs_locally(era5, query):
-    result = run(query, {"era5": era5}, **LOCAL)
+def test_a_query_that_cant_be_cut_runs_here_with_lambdas_disabled(era5, query):
+    result = run(query, {"era5": era5}, **LOCAL, config=DISABLED)
 
     assert result.chunks is None
     rows_close(result.table.to_pylist(), query_locally(era5, query))
