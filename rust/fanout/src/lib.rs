@@ -16,10 +16,12 @@ use datafusion::arrow::array::{AsArray, UInt64Array};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::datatypes::UInt64Type;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::extensions_options;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::{extensions_options, JoinType};
 use datafusion::config::{ConfigExtension, ConfigOptions};
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::sink::DataSinkExec;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::expressions::Column;
@@ -30,6 +32,7 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -433,13 +436,17 @@ fn without_round_robin(fragment: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn Execu
 
 /// The Zarr scan under a partial aggregate, if every node between them works
 /// row by row, so that a worker given some chunks computes exactly their share
-/// of the partial states.
-// TODO: a broadcast join, where the other side is small enough for every worker to read whole.
+/// of the partial states. A join counts when every worker can be sent its
+/// build side whole.
 fn chunkwise_scan(partial: &Arc<dyn ExecutionPlan>) -> Option<&ZarrExec> {
     let mut node = *partial.children().first()?;
     loop {
         if let Some(scan) = node.downcast_ref::<ZarrExec>() {
             return Some(scan);
+        }
+        if let Some(probe) = broadcast_probe(node) {
+            node = probe;
+            continue;
         }
         let rowwise = node.is::<ProjectionExec>()
             || node.is::<FilterExec>()
@@ -453,6 +460,55 @@ fn chunkwise_scan(partial: &Arc<dyn ExecutionPlan>) -> Option<&ZarrExec> {
             return None;
         }
         node = child;
+    }
+}
+
+/// The most a broadcast build side may hold, which travels in the fragment, in
+/// every dispatcher's request, under Lambda's 6 MB request limit.
+const BROADCAST_BYTES: usize = 1024 * 1024;
+
+/// The probe side of an inner join whose build side is rows held in this
+/// process, few enough to broadcast. An inner join matches each probe row
+/// against the whole build side alone, so it works row by row on the probe
+/// side; an outer join would repeat its unmatched build rows on every worker.
+fn broadcast_probe(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
+    let (join_type, build, probe) = if let Some(join) = node.downcast_ref::<NestedLoopJoinExec>() {
+        (join.join_type(), join.left(), join.right())
+    } else {
+        let join = node
+            .downcast_ref::<HashJoinExec>()
+            .filter(|j| *j.partition_mode() == PartitionMode::CollectLeft)?;
+        (join.join_type(), join.left(), join.right())
+    };
+    (*join_type == JoinType::Inner && in_memory_bytes(build)? <= BROADCAST_BYTES).then_some(probe)
+}
+
+/// The bytes of rows `plan` holds in memory, if that's all it reads, through
+/// nodes that pass them on.
+fn in_memory_bytes(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    if let Some(source) = plan.downcast_ref::<DataSourceExec>() {
+        let memory = source.data_source().downcast_ref::<MemorySourceConfig>()?;
+        return Some(
+            memory
+                .partitions()
+                .iter()
+                .flatten()
+                .map(RecordBatch::get_array_memory_size)
+                .sum(),
+        );
+    }
+    let passes_on = plan.is::<ProjectionExec>()
+        || plan.is::<FilterExec>()
+        || plan.is::<RepartitionExec>()
+        || plan.is::<CoalescePartitionsExec>()
+        || plan.is::<CooperativeExec>();
+    let [child] = plan.children()[..] else {
+        return None;
+    };
+    if passes_on {
+        in_memory_bytes(child)
+    } else {
+        None
     }
 }
 

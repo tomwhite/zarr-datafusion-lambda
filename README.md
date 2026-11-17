@@ -8,10 +8,13 @@ ERA5 (745,128 chunks, 3.1 TB uncompressed) takes ~88s and costs ~$2.17**
 **The mean temperature of each of the 721 latitudes over the same ERA5 record
 takes ~92s and costs ~$2.25**
 
+**The mean temperature inside each of five continental boxes over the same
+ERA5 record takes ~102s and costs ~$2.49**
+
 **The hourly climatology of every grid cell over the same ERA5 record, written to
 Zarr on S3, takes ~136s and costs ~$3.07**
 
-All three answers match xarray for a sample, and the global means match those
+All four answers match xarray for a sample, and the global means match those
 Copernicus publishes from ERA5 to within 0.001°C for all but one of the ~1000
 months.
 
@@ -26,6 +29,10 @@ for each worker are streamed back to the client which completes the rest of the 
 
 For the zonal mean, every worker returns a partial row for every latitude, so
 the dispatchers merge them as they arrive and send the client one state each.
+
+For the region statistics, the boxes are a small table joined with the
+scan. Each worker is sent the table in its fragment and joins its own chunks
+with it, and the dispatchers merge the partial rows as for the zonal mean.
 
 For the climatology, each worker processes all of a group's rows, so it runs
 the final aggregate, and writes the output itself.
@@ -279,6 +286,56 @@ uv run benchmarks/zonal_mean_check.py results/zonal-mean-<a month's run>.json
 ```
 
 A month's run matches xarray to within 1e-6°C at every latitude.
+
+## Region statistics
+
+`benchmarks/region_statistics.py` computes the mean `t2m` inside each of five
+continental boxes, over the same ERA5 as the global mean:
+
+```sql
+SELECT r.region, avg(a.t2m) - 273.15 AS avg_c, count(*) AS n
+FROM (VALUES ('Amazon', -10.0, 5.0, 290.0, 310.0),
+             ('Australia_Outback', -30.0, -20.0, 125.0, 140.0),
+             ('Greenland', 65.0, 80.0, 300.0, 340.0),
+             ('SE_Asia', 5.0, 20.0, 95.0, 110.0),
+             ('Sahara', 18.0, 30.0, 0.0, 30.0)) AS r(region, south, north, west, east)
+JOIN era5 a
+  ON a.latitude BETWEEN r.south AND r.north AND a.longitude BETWEEN r.west AND r.east
+WHERE a.valid_time >= TIMESTAMP '{start}' AND a.valid_time < TIMESTAMP '{end}'
+GROUP BY r.region
+ORDER BY r.region
+```
+
+The boxes are a small table, so every worker is sent it in its fragment and
+joins its own chunks with it. They are written first: DataFusion holds the
+table written first in memory and streams the other past it, so written the
+other way round, the raster would be held in memory and the query would not
+fan out. Every invocation returns a partial row for every box, which the
+dispatchers merge as for the zonal mean.
+
+By default it runs over a month:
+
+```shell
+uv run python benchmarks/region_statistics.py
+```
+
+Then the whole record, which costs about $2.50:
+
+```shell
+uv run python benchmarks/region_statistics.py --start 1940-01-01 --end 2025-01-01
+```
+
+In one run, the whole record took 101.6s and cost approximately $2.49: 31,047
+invocations of 24 hourly chunks, merged into one state by one dispatcher.
+
+### Checking the results
+
+```shell
+# every box of a month's run against xarray, reading about 3 GB from us-east-1
+uv run benchmarks/region_statistics_check.py results/region-statistics-<a month's run>.json
+```
+
+A month's run matches xarray exactly in every box.
 
 ## Hourly climatology
 

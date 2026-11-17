@@ -275,7 +275,7 @@ CASES = {
     "derived-variable": Case(DERIVED_VARIABLE, (), derived_variable, variables=SURFACE),
     "anomaly": Case(ANOMALY, (PARTIAL,), anomaly),
     "persistence-skill": Case(PERSISTENCE_SKILL, (), persistence_skill),
-    "region-statistics": Case(REGION_STATISTICS, (), region_statistics),
+    "region-statistics": Case(REGION_STATISTICS, (PARTIAL,), region_statistics),
     "reprojection": Case(REPROJECTION),
     "regridding": Case(REGRIDDING, (), regridding, weights=True),
 }
@@ -388,7 +388,6 @@ SHOULD = {
         (PARTIAL,),
         "two-scan fragments, with the truth's chunks derived from the join predicate",
     ),
-    "region-statistics": ((PARTIAL,), "a broadcast join of a small table"),
     "regridding": (
         (FINAL,),
         "a broadcast join of a small table, then the final aggregate on the workers, "
