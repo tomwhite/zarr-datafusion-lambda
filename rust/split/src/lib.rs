@@ -38,10 +38,12 @@ mod bounded;
 pub mod compact;
 mod merge;
 mod per_value;
+mod reduce;
 mod requests;
 
-pub use merge::merge_partials;
+pub use merge::{merge_partials, partial_reduce};
 pub use per_value::PerValueRule;
+pub use reduce::{encode_reduce, Reduce, COMBINER};
 
 /// A session state that reads Zarr tables, without zarr-datafusion's
 /// `CardinalityRule`: its aggregate pushdown replaces an aggregate with one node

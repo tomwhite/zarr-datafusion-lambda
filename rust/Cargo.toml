@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "dispatcher",
+    "dispatcher-partial-reduce",
     "fanout",
     "fragment",
     "python",
@@ -11,6 +12,7 @@ members = [
 # built by maturin.
 default-members = [
     "dispatcher",
+    "dispatcher-partial-reduce",
     "fragment",
     "split",
 ]

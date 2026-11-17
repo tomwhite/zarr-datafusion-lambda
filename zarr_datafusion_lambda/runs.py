@@ -19,6 +19,9 @@ from zarr_datafusion_lambda.deploy import PROJECT
 
 FUNCTION = "fragment"
 
+# keep in sync with `COMBINER` in rust/split
+COMBINER = "partial-reduce"
+
 
 def describe(name: str, values: list[float]) -> str:
     """Percentiles of `values`, in milliseconds, on one line."""
@@ -37,21 +40,29 @@ def run(query: str, tables: dict[str, sql.Table], **settings: Any) -> dict[str, 
     result = sql.run(query, tables, progress=True, return_stats=True, **settings)
     wall = time.monotonic() - started
     [report] = result.reports
-    workers = {w["index"]: w for w in report["workers"]}
+    # each worker's output, or with a combine, each state its dispatcher merged
+    responses = report["workers"]
+    combined = any("indexes" in r for r in responses)
+    # A state's requests can't be told apart by invocation, so they count
+    # against its first.
+    requests = {(r["indexes"][0] if combined else r["index"]): r["s3_requests"] for r in responses}
+    none = {"gets": 0, "lists": 0}
     return {
         "chunks": report["chunks"],
+        "combined": combined,
         "invocations": [
             {
                 **r,
-                "s3_gets": workers[r["index"]]["s3_requests"]["gets"],
-                "s3_lists": workers[r["index"]]["s3_requests"]["lists"],
+                "s3_gets": requests.get(r["index"], none)["gets"],
+                "s3_lists": requests.get(r["index"], none)["lists"],
             }
             for r in report["invocation_stats"]
         ],
         "dispatchers": report["dispatcher_stats"],
         "arrivals": report["arrivals"],
-        "timings": [w["timings_ms"] for w in report["workers"]],
-        "chunks_in_flight": sorted({w["chunks_in_flight"] for w in report["workers"]}),
+        "states": len(responses) if combined else None,
+        "timings": [] if combined else [r["timings_ms"] for r in responses],
+        "chunks_in_flight": [] if combined else sorted({r["chunks_in_flight"] for r in responses}),
         "rows": result.table.to_pylist(),
         "wall_s": wall,
         "fan_out_s": report["elapsed_s"],
@@ -68,16 +79,21 @@ def print_run(result: dict[str, Any], concurrency: int, expected: int, chunk_byt
     )
     print(
         f"wall {wall:.1f}s: fan-out {result['fan_out_s']:.1f}s, "
-        f"planning and combine {wall - result['fan_out_s']:.1f}s"
+        f"planning and finishing {wall - result['fan_out_s']:.1f}s"
     )
     scanned = result["chunks"] * chunk_bytes
     print(f"scanned {scanned / 1e12:.2f} TB uncompressed, {scanned / 1e9 / wall:.1f} GB/s")
 
     invokes = [(r["invoke_end"] - r["invoke_start"]) * 1000 for r in result["invocations"]]
     print(describe("invoke", invokes))
-    for step in result["timings"][0]:
-        print(describe(f"- {step}", [t[step] for t in result["timings"]]))
-    print(f"chunks in flight on the workers: {result['chunks_in_flight']}")
+    if result["combined"]:
+        print(
+            f"merged in the dispatchers into {result['states']:,} states, without workers' timings"
+        )
+    else:
+        for step in result["timings"][0]:
+            print(describe(f"- {step}", [t[step] for t in result["timings"]]))
+        print(f"chunks in flight on the workers: {result['chunks_in_flight']}")
     print(arrived(result))
     gets = sum(r["s3_gets"] for r in result["invocations"])
     lists = sum(r["s3_lists"] for r in result["invocations"])
@@ -147,7 +163,9 @@ def report(result: dict[str, Any], saved: Path) -> None:
         result["dispatchers"],
         query_all_reports(
             logs,
-            deployed.function_name(DISPATCHER),
+            deployed.function_name(
+                f"{DISPATCHER}-{COMBINER}" if result.get("combined") else DISPATCHER
+            ),
             {c["req_id"] for c in result["dispatchers"]},
             windows,
         ),

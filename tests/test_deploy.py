@@ -1,9 +1,10 @@
 from click.testing import CliRunner
+from map_lambda import DISPATCHER
 from map_lambda.deploy import spec
 
 from zarr_datafusion_lambda.cli import cli
 from zarr_datafusion_lambda.deploy import PROJECT, SPEC
-from zarr_datafusion_lambda.runs import FUNCTION
+from zarr_datafusion_lambda.runs import COMBINER, FUNCTION
 
 
 def test_the_project_is_the_distribution_s_name():
@@ -13,6 +14,12 @@ def test_the_project_is_the_distribution_s_name():
 def test_the_spec_deploys_the_worker_the_client_calls():
     (fragment,) = spec.load(SPEC).functions
     assert fragment.name == FUNCTION
+
+
+def test_the_spec_deploys_the_dispatchers_the_client_calls():
+    deployed = spec.load(SPEC)
+
+    assert [d.name for d in deployed.dispatchers] == [DISPATCHER, f"{DISPATCHER}-{COMBINER}"]
 
 
 def test_the_spec_builds_from_this_workspace():

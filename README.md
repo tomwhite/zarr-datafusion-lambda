@@ -5,10 +5,13 @@ How fast can we query ERA5 Zarr data using SQL and the [map-lambda](https://gith
 **The monthly area-weighted global mean temperature over 85 years of hourly
 ERA5 (745,128 chunks, 3.1 TB uncompressed) takes ~88s and costs ~$2.17**
 
+**The mean temperature of each of the 721 latitudes over the same ERA5 record
+takes ~92s and costs ~$2.25**
+
 **The hourly climatology of every grid cell over the same ERA5 record, written to
 Zarr on S3, takes ~136s and costs ~$3.07**
 
-Both answers match xarray for a sample, and the global means match those
+All three answers match xarray for a sample, and the global means match those
 Copernicus publishes from ERA5 to within 0.001°C for all but one of the ~1000
 months.
 
@@ -21,6 +24,9 @@ A new physical operator `MapLambdaZarrExec` is used to run partial
 aggregates on Lambda workers. For the global means, the partial aggregate results
 for each worker are streamed back to the client which completes the rest of the plan.
 
+For the zonal mean, every worker returns a partial row for every latitude, so
+the dispatchers merge them as they arrive and send the client one state each.
+
 For the climatology, each worker processes all of a group's rows, so it runs
 the final aggregate, and writes the output itself.
 
@@ -28,9 +34,9 @@ This project is set up for running benchmarks, it is not a general purpose SQL e
 
 ## Dependencies
 
-map-lambda is pinned to a release, 0.1.0: `map-lambda==0.1.0` from PyPI
-for Python, and its tag, `v0.1.0`, for the Rust crates and the dispatcher, so
-that the client and dispatcher come from the same release. zarr-datafusion is built
+map-lambda is pinned to a release: from PyPI for Python, and the release's
+tag for the Rust crates and the dispatchers, so that the client and
+dispatchers come from the same release. zarr-datafusion is built
 from a pinned commit on GitHub.
 
 zarr-datafusion comes from the `lambda-zarr-write` branch of a fork,
@@ -58,8 +64,9 @@ cd rust && cargo test
 
 The lambdas are deployed as the map-lambda project `zarr-datafusion-lambda`,
 described by `zarr_datafusion_lambda/deploy.toml`: one CloudFormation
-stack holding `zarr-datafusion-lambda-dispatcher`, `zarr-datafusion-lambda-fragment`,
-their roles and their logs.
+stack holding `zarr-datafusion-lambda-dispatcher`,
+`zarr-datafusion-lambda-dispatcher-partial-reduce`, which merges the workers'
+partial rows, `zarr-datafusion-lambda-fragment`, their roles and their logs.
 
 The data is in us-east-1, so the workers must be there too (a query refuses
 to run otherwise), which the spec fixes. ERA5 is read anonymously, so a
@@ -229,6 +236,50 @@ AggregateExec: mode=Partial, gby=[date_trunc(month, CAST(valid_time@1 AS Timesta
 Each worker binds the fragment's `ZarrExec` to its own chunks, and returns
 one partial row per month it touches.
 
+## Zonal mean
+
+`benchmarks/zonal_mean.py` computes the mean `t2m` of each of the 721
+latitudes, over the same ERA5 as the global mean:
+
+```sql
+SELECT latitude, avg(t2m) - 273.15 AS air_mean_c, count(*) AS n
+FROM era5
+WHERE valid_time >= TIMESTAMP '{start}' AND valid_time < TIMESTAMP '{end}'
+GROUP BY latitude
+ORDER BY latitude DESC
+```
+
+Every invocation returns a partial row for every latitude, 35 KB, so the
+partial rows grow with the invocations rather than with the answer. The
+dispatchers merge them as they arrive, through the
+`dispatcher-partial-reduce` function, and send the client one state each.
+
+By default it runs over a month:
+
+```shell
+uv run python benchmarks/zonal_mean.py
+```
+
+Then the whole record, which costs about $2.25:
+
+```shell
+uv run python benchmarks/zonal_mean.py --start 1940-01-01 --end 2025-01-01
+```
+
+In one run, the whole record took 92.2s and cost approximately $2.25: 31,047
+invocations of 24 hourly chunks, merged into one state by one dispatcher.
+
+<img src="./era5-zonal-mean-c990-timeline.svg">
+
+### Checking the results
+
+```shell
+# every latitude of a month's run against xarray, reading about 3 GB from us-east-1
+uv run benchmarks/zonal_mean_check.py results/zonal-mean-<a month's run>.json
+```
+
+A month's run matches xarray to within 1e-6°C at every latitude.
+
 ## Hourly climatology
 
 `benchmarks/climatology.py` computes the mean `t2m` of every grid cell for
@@ -287,7 +338,7 @@ about 2 seconds.
 
 Set the version in `pyproject.toml` (`0.1.0.devN` for now), run `uv lock`,
 and push a tag of the same version prefixed with `v`. The release workflow
-builds the dispatcher and fragment zips, and wheels for Linux x86-64 and
+builds the dispatchers' and fragment's zips, and wheels for Linux x86-64 and
 arm64 and macOS arm64 carrying the zips' checksums, then attaches them all to
 a GitHub release. Then update the release URLs under Running on AWS.
 

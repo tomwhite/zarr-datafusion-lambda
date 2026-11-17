@@ -71,8 +71,9 @@ def session(tables: dict[str, Table], **settings: Any) -> Session:
     succeeded and how many it has: with none before it invokes, then as they
     arrive, and `config`, DataFusion's options by key, such as
     `{"lambda.enabled": "false"}` to run every query here, as SQL's `SET`
-    would. A fan-out over an S3 bucket in another region than the workers is
-    refused before it starts.
+    would, or `{"lambda.combine": "false"}` to have every worker's partial rows
+    sent here rather than merged in the dispatchers. A fan-out over an S3 bucket
+    in another region than the workers is refused before it starts.
     """
     export_credentials()
     return Session(
