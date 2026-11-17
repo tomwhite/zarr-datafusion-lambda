@@ -4477,7 +4477,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.45",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tracing",
@@ -4516,7 +4516,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -5546,7 +5546,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6408,7 +6408,7 @@ dependencies = [
 [[package]]
 name = "zarr-datafusion"
 version = "0.1.1"
-source = "git+https://github.com/tomwhite/zarr-datafusion?rev=6a3ab08#6a3ab08b4b58b2a75fb871feabd4f224e6689d55"
+source = "git+https://github.com/tomwhite/zarr-datafusion?rev=5ab21a6#5ab21a66b50c3c5018a9fe2c203db72cdea6a67f"
 dependencies = [
  "arrow",
  "async-trait",

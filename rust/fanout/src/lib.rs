@@ -396,9 +396,17 @@ fn write(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>
     let Some(zarr) = sink.sink().downcast_ref::<ZarrDataSink>() else {
         return Ok(None);
     };
-    if !fan_out.tiles_chunks(zarr.spec()) {
-        return Ok(None);
-    }
+    let runs = if fan_out.tiles_chunks(zarr.spec()) {
+        fan_out.runs.clone()
+    } else {
+        match fan_out
+            .runs_by_output_chunk(zarr.spec())
+            .or_else(|| fan_out.runs_by_output_box(zarr.spec()))
+        {
+            Some(runs) => runs,
+            None => return Ok(None),
+        }
+    };
     let fragment = Arc::new(DataSinkExec::new(
         inline(sink.input().clone(), &fan_out.plan)?,
         Arc::new(zarr.clone().writing_chunks()),
@@ -406,7 +414,7 @@ fn write(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>
     ));
     Ok(Some(Arc::new(MapLambdaZarrExec::new(
         fragment,
-        fan_out.runs.clone(),
+        runs,
         false,
         fan_out.fan_out.clone(),
     )?)))
@@ -895,9 +903,10 @@ impl MapLambdaZarrExec {
         self.runs.iter().map(Vec::len).sum()
     }
 
-    /// Whether each of `spec`'s chunks lies in one tile, so that one worker writes
-    /// it: along each axis the tiles are cut on, the grid is the whole source axis,
-    /// and its chunks divide the source's.
+    /// Whether each of `spec`'s chunks lies in one invocation's share, so that one
+    /// worker writes it: along each axis invocations split, the tiles' inner axes
+    /// or else the outer, the grid is the whole source axis, and its chunks divide
+    /// the source's.
     fn tiles_chunks(&self, spec: &SkeletonSpec) -> bool {
         let Some(tile) = self.runs.first().and_then(|run| run.first()) else {
             return false;
@@ -913,7 +922,17 @@ impl MapLambdaZarrExec {
         let Some(var) = meta.data_vars.first() else {
             return false;
         };
-        tile.extra.iter().all(|(coord, _)| {
+        // Invocations split the inner axes a tile is cut along, or else the outer.
+        let split: Vec<usize> = if tile.extra.is_empty() {
+            let outer = var.dimensions.as_ref().and_then(|dims| dims.first());
+            match outer.and_then(|name| meta.coords.iter().position(|c| &c.name == name)) {
+                Some(coord) => vec![coord],
+                None => return false,
+            }
+        } else {
+            tile.extra.iter().map(|(coord, _)| *coord).collect()
+        };
+        split.iter().all(|coord| {
             let name = &meta.coords[*coord].name;
             let source_chunk = var
                 .dimensions
@@ -930,6 +949,125 @@ impl MapLambdaZarrExec {
                 _ => false,
             }
         })
+    }
+
+    /// The runs re-dealt so that each invocation writes whole chunks of `spec`
+    /// along the outer axis, about as many hours each as before, for a fan-out
+    /// split along it alone. A source chunk an output chunk boundary crosses is
+    /// read by both sides of it: reads may overlap, writes must not.
+    fn runs_by_output_chunk(&self, spec: &SkeletonSpec) -> Option<Vec<Vec<PartitionSpec>>> {
+        let specs: Vec<&PartitionSpec> = self.runs.iter().flatten().collect();
+        if specs.iter().any(|s| !s.extra.is_empty()) {
+            return None;
+        }
+        let scans = split::zarr_scans(&self.plan).ok()?;
+        let meta = scans.first()?.downcast_ref::<ZarrExec>()?.store_meta()?;
+        let outer = meta.data_vars.first()?.dimensions.as_ref()?.first()?;
+        let axis = spec.coords.iter().position(|c| &c.name == outer)?;
+        let chunk = usize::try_from(spec.chunks[axis]).ok().filter(|&c| c > 0)?;
+        let mut ranges: Vec<(usize, usize)> =
+            specs.iter().map(|s| s.as_range()).collect::<Option<_>>()?;
+        ranges.sort();
+        let first = ranges.first()?.0;
+        // The output's axis is the scan's selection, so output index i is source
+        // index first + i, but only if the selection has no gaps.
+        let selected: usize = ranges.iter().map(|(s, e)| e - s).sum();
+        let contiguous = ranges.windows(2).all(|w| w[0].1 == w[1].0);
+        if !contiguous || selected != spec.coords[axis].values.len() {
+            return None;
+        }
+        let mut by_chunk: BTreeMap<usize, Vec<PartitionSpec>> = BTreeMap::new();
+        for (start, end) in ranges {
+            let mut at = start;
+            while at < end {
+                let k = (at - first) / chunk;
+                let to = end.min(first + (k + 1) * chunk);
+                by_chunk.entry(k).or_default().push(PartitionSpec {
+                    outer: CoordSelection::Range(at, to),
+                    extra: vec![],
+                });
+                at = to;
+            }
+        }
+        let per_run: usize = self
+            .runs
+            .first()?
+            .iter()
+            .filter_map(|s| s.as_range())
+            .map(|(s, e)| e - s)
+            .sum();
+        let chunks_per_run = (per_run / chunk).max(1);
+        let chunks: Vec<_> = by_chunk.into_values().collect();
+        Some(
+            chunks
+                .chunks(chunks_per_run)
+                .map(|run| run.concat())
+                .collect(),
+        )
+    }
+
+    /// The runs re-dealt so that each invocation writes one of `spec`'s chunks
+    /// over the inner axes the tiles are cut along, through all of time, for a
+    /// fan-out dealt by tile. Each reads its box from whichever tiles it overlaps:
+    /// a cell lies in one box, so its groups stay whole.
+    fn runs_by_output_box(&self, spec: &SkeletonSpec) -> Option<Vec<Vec<PartitionSpec>>> {
+        let specs: Vec<&PartitionSpec> = self.runs.iter().flatten().collect();
+        let first = specs.first()?;
+        if first.extra.is_empty() {
+            return None;
+        }
+        let scans = split::zarr_scans(&self.plan).ok()?;
+        let meta = scans.first()?.downcast_ref::<ZarrExec>()?.store_meta()?;
+        // The output's chunks along each axis the tiles are cut on, which must
+        // cover the whole source axis, so that output and source indexes agree.
+        let mut axes: Vec<(usize, Vec<(usize, usize)>)> = vec![];
+        for (coord, _) in &first.extra {
+            let name = &meta.coords[*coord].name;
+            let extent = usize::try_from(*meta.coords[*coord].shape.first()?).ok()?;
+            let axis = spec.coords.iter().position(|c| &c.name == name)?;
+            let chunk = usize::try_from(spec.chunks[axis]).ok().filter(|&c| c > 0)?;
+            if spec.coords[axis].values.len() != extent {
+                return None;
+            }
+            let pieces = (0..extent)
+                .step_by(chunk)
+                .map(|start| (start, extent.min(start + chunk)))
+                .collect();
+            axes.push((*coord, pieces));
+        }
+        let mut outers: Vec<CoordSelection> = vec![];
+        for spec in &specs {
+            if !outers.contains(&spec.outer) {
+                outers.push(spec.outer.clone());
+            }
+        }
+        let mut boxes: Vec<Vec<(usize, CoordSelection)>> = vec![vec![]];
+        for (coord, pieces) in axes {
+            boxes = boxes
+                .into_iter()
+                .flat_map(|b| {
+                    pieces.iter().map(move |&(start, end)| {
+                        let mut b = b.clone();
+                        b.push((coord, CoordSelection::Range(start, end)));
+                        b
+                    })
+                })
+                .collect();
+        }
+        Some(
+            boxes
+                .into_iter()
+                .map(|extra| {
+                    outers
+                        .iter()
+                        .map(|outer| PartitionSpec {
+                            outer: outer.clone(),
+                            extra: extra.clone(),
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
     }
 
     pub fn report(&self) -> Report {
