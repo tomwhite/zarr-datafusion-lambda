@@ -6,24 +6,23 @@ import numpy as np
 import pyarrow as pa
 import pytest
 import zarr
-from map_lambda import LOCAL_ENDPOINT_URL
 
+from tests.stores import (
+    CHUNKS,
+    DISABLED,
+    LOCAL,
+    PENCILS,
+    SHAPE,
+    TIME_START,
+    VARIABLE,
+    rows_close,
+    write_group,
+)
 from zarr_datafusion_lambda.sql import explain, location, run, session
 
-LOCAL = {"endpoint_url": LOCAL_ENDPOINT_URL, "concurrency": 100}
 # for what each worker measured, which a combine sums
 UNCOMBINED = {"lambda.combine": "false"}
 
-VARIABLE = "t2m"
-DIMS = ("time", "latitude", "longitude")
-TIME_UNITS = "hours since 1979-01-01 00:00:00"
-TIME_START = np.datetime64("1979-01-01T00", "h")
-
-# 60 chunks of 31 hours, January to mid-March 1979 on a 10° grid
-SHAPE = (31 * 60, 19, 36)
-CHUNKS = (31, 19, 36)
-# as `single/temporal` is chunked: a run of hours of a tile, here 6 runs of 4 by 6 tiles
-PENCILS = (310, 5, 6)
 # neither bound falls on a chunk boundary
 WINDOW = "time >= TIMESTAMP '1979-01-15 03:00:00' AND time < TIMESTAMP '1979-03-01 00:00:00'"
 
@@ -64,30 +63,6 @@ GROUP BY latitude, longitude, date_part('hour', CAST(time AS TIMESTAMP))
 ORDER BY latitude DESC, longitude, hour
 """,
 }
-
-
-def write_group(path, with_values=True, chunks=CHUNKS):
-    """An ERA5-shaped group, hourly from 1979 on a global grid, as xarray writes one."""
-    group = zarr.open_group(path, mode="w", zarr_format=3)
-    n_time, n_lat, n_lon = SHAPE
-    coordinates = {
-        "time": np.arange(n_time, dtype="int64"),
-        "latitude": 90.0 - 180.0 * np.arange(n_lat) / (n_lat - 1),
-        "longitude": 360.0 * np.arange(n_lon) / n_lon,
-    }
-    for name, values in coordinates.items():
-        group.create_array(name, shape=values.shape, dtype=values.dtype, dimension_names=[name])[
-            :
-        ] = values
-    group["time"].attrs.update({"units": TIME_UNITS, "calendar": "standard"})
-    variable = group.create_array(
-        VARIABLE, shape=SHAPE, chunks=chunks, dtype="float32", dimension_names=DIMS
-    )
-    if with_values:
-        # warm at the equator, cold at the poles, plus noise
-        profile = 288 - 40 * np.sin(np.radians(coordinates["latitude"])) ** 2
-        noise = np.random.default_rng(0).uniform(-15, 15, SHAPE)
-        variable[:] = (profile[:, None] + noise).astype("float32")
 
 
 @pytest.fixture
@@ -137,17 +112,6 @@ QUERIES = [
     "SELECT max(mean) AS warmest, count(*) AS n FROM "
     "(SELECT latitude, avg(t2m) AS mean FROM era5 GROUP BY latitude)",
 ]
-
-
-def rows_close(actual, expected):
-    assert len(actual) == len(expected)
-    for a, e in zip(actual, expected, strict=True):
-        assert a.keys() == e.keys()
-        for k in a:
-            if isinstance(e[k], float):
-                assert a[k] == pytest.approx(e[k], rel=1e-9), k
-            else:
-                assert a[k] == e[k], k
 
 
 @pytest.mark.lambda_integration
@@ -287,9 +251,6 @@ SELF_JOIN = (
 
 def fragments(tables, query):
     return session(tables, **LOCAL).fragments(query)
-
-
-DISABLED = {"lambda.enabled": "false"}
 
 
 def test_with_lambdas_disabled_a_query_runs_here_with_the_same_answer(era5):
