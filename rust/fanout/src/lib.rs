@@ -3,7 +3,8 @@
 //! cut off on `fragment` lambdas, a run of chunks each, streaming the partial
 //! states back to the rest of the plan as workers finish. When no group's rows
 //! span two invocations, the final aggregate runs on the workers too. A plan
-//! with nothing to cut runs in this process.
+//! that would leave a Zarr scan or write in this process is refused, unless
+//! `lambda.enabled` is off, which runs all of it here.
 
 pub mod region;
 
@@ -259,20 +260,29 @@ impl PhysicalOptimizerRule for FanOutRule {
             return Ok(plan);
         }
         let combine = options.is_none_or(|options| options.combine);
-        plan.transform_up(|node| {
-            let exec = match self.cut(&node, combine)? {
-                Some(exec) => Some(exec),
-                None => match finish(&node)? {
+        let plan = plan
+            .transform_up(|node| {
+                let exec = match self.cut(&node, combine)? {
                     Some(exec) => Some(exec),
-                    None => write(&node)?,
-                },
-            };
-            Ok(match exec {
-                Some(exec) => Transformed::yes(exec),
-                None => Transformed::no(node),
-            })
-        })
-        .map(|t| t.data)
+                    None => match finish(&node)? {
+                        Some(exec) => Some(exec),
+                        None => write(&node)?,
+                    },
+                };
+                Ok(match exec {
+                    Some(exec) => Transformed::yes(exec),
+                    None => Transformed::no(node),
+                })
+            })?
+            .data;
+        // Refused rather than run here, where it would work but slowly.
+        if let Some(why) = left_here(&plan, &mut vec![]) {
+            return Err(DataFusionError::Plan(format!(
+                "this query can't run on the workers: {why}. \
+                 SET lambda.enabled = false to run all of it here"
+            )));
+        }
+        Ok(plan)
     }
 
     fn name(&self) -> &str {
@@ -462,6 +472,119 @@ fn chunkwise_scan(partial: &Arc<dyn ExecutionPlan>) -> Option<&ZarrExec> {
         }
         node = child;
     }
+}
+
+/// Why some of `plan` would run here rather than on the workers, if any would: a
+/// Zarr scan the cut left in place, or a Zarr write over a fan-out. `above` is
+/// the path down to `node`.
+fn left_here<'a>(
+    node: &'a Arc<dyn ExecutionPlan>,
+    above: &mut Vec<&'a Arc<dyn ExecutionPlan>>,
+) -> Option<String> {
+    if let Some(scan) = node.downcast_ref::<ZarrExec>() {
+        return Some(scan_left_here(scan, node, above));
+    }
+    if let Some(sink) = node.downcast_ref::<DataSinkExec>() {
+        let fan_out = fan_out_under(sink.input());
+        if sink.sink().downcast_ref::<ZarrDataSink>().is_some() && fan_out.is_some() {
+            return Some(if fan_out.is_some_and(|f| f.finished) {
+                "the Zarr output's chunks don't each lie in one invocation's share of \
+                 the source, so two workers would write one"
+                    .to_string()
+            } else {
+                "groups span invocations, so the final aggregate and the Zarr write \
+                 would run here"
+                    .to_string()
+            });
+        }
+    }
+    above.push(node);
+    for child in node.children() {
+        if let Some(why) = left_here(child, above) {
+            return Some(why);
+        }
+    }
+    above.pop();
+    None
+}
+
+/// The fan-out a Zarr sink writes, through nodes that pass its rows on.
+fn fan_out_under(plan: &Arc<dyn ExecutionPlan>) -> Option<&MapLambdaZarrExec> {
+    if let Some(fan_out) = plan.downcast_ref::<MapLambdaZarrExec>() {
+        return Some(fan_out);
+    }
+    let [child] = plan.children()[..] else {
+        return None;
+    };
+    fan_out_under(child)
+}
+
+/// Why the cut left `scan` here, from the nodes above it.
+fn scan_left_here(
+    scan: &ZarrExec,
+    node: &Arc<dyn ExecutionPlan>,
+    above: &[&Arc<dyn ExecutionPlan>],
+) -> String {
+    if scan.limit().is_some() || scan.partitions().is_empty() {
+        return "a Zarr scan can't be split into chunks: it has a limit, or reads its store \
+                whole"
+            .to_string();
+    }
+    let path: Vec<_> = above.iter().copied().chain([node]).collect();
+    for pair in path.windows(2).rev() {
+        let (parent, child) = (pair[0], pair[1]);
+        let sides = match parent.downcast_ref::<NestedLoopJoinExec>() {
+            Some(join) => Some((join.left(), join.right())),
+            None => parent
+                .downcast_ref::<HashJoinExec>()
+                .map(|join| (join.left(), join.right())),
+        };
+        if let Some((build, probe)) = sides {
+            let other = if Arc::ptr_eq(build, child) {
+                probe
+            } else {
+                build
+            };
+            return if !split::zarr_scans(other).unwrap_or_default().is_empty() {
+                "two Zarr scans are joined, which would need fragments of two scans".to_string()
+            } else if Arc::ptr_eq(build, child) {
+                "a Zarr scan is a join's build side: write the smaller side first".to_string()
+            } else if contains_fan_out(other) {
+                "a Zarr scan is joined with another fan-out's result, which would need a \
+                 sliced broadcast"
+                    .to_string()
+            } else {
+                "a Zarr scan is joined with a side that can't be sent to every worker: that \
+                 needs an inner join, and rows held in memory, at most 1 MB, on its build side"
+                    .to_string()
+            };
+        }
+        if parent.children().len() > 1 {
+            return format!(
+                "a Zarr scan is under a {}, which can't be cut by chunk",
+                parent.name()
+            );
+        }
+    }
+    if !above.iter().any(|n| n.is::<AggregateExec>()) {
+        return "a Zarr scan has no aggregate above it to cut at, and map-only fragments \
+                aren't built"
+            .to_string();
+    }
+    let blocking: Vec<_> = above
+        .iter()
+        .rev()
+        .take_while(|n| !n.is::<AggregateExec>())
+        .map(|n| n.name())
+        .collect();
+    format!(
+        "the nodes between a Zarr scan and its aggregate don't work chunk by chunk: {}",
+        blocking.join(", ")
+    )
+}
+
+fn contains_fan_out(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.is::<MapLambdaZarrExec>() || plan.children().into_iter().any(contains_fan_out)
 }
 
 /// The most a broadcast build side may hold, which travels in the fragment, in

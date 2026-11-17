@@ -16,7 +16,7 @@ fn err(e: impl std::fmt::Display) -> PyErr {
 }
 
 /// Zarr tables, queried with each partial aggregate over a chunkwise scan
-/// fanned out on `fragment` lambdas, and everything else in this process.
+/// fanned out on `fragment` lambdas, and the rest in this process.
 #[pyclass(frozen)]
 struct Session {
     runtime: tokio::runtime::Runtime,
