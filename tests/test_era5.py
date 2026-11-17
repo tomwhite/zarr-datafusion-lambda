@@ -5,6 +5,7 @@ import datafusion
 import numpy as np
 import pyarrow as pa
 import pytest
+import xarray as xr
 import zarr
 
 from tests.stores import (
@@ -376,11 +377,14 @@ def test_a_group_key_without_the_tiles_axes_is_dealt_in_listing_order(tmp_path):
     [GLOBAL_CLIMATOLOGY, GLOBAL_CLIMATOLOGY.replace("FROM era5\n", f"FROM era5\nWHERE {WINDOW}\n")],
     ids=["all-time", "windowed"],
 )
+# tiles of 5 latitudes by 6 longitudes: chunks the same, spanning two, and smaller and
+# not dividing them, so two boxes read parts of one pencil
+@pytest.mark.parametrize("chunks", ["24,5,6", "24,10,6", "24,3,4"])
 def test_a_zarr_copy_of_the_climatology_over_pencils_matches_one_process(
-    era5_pencils, tmp_path, climatology
+    era5_pencils, tmp_path, climatology, chunks
 ):
     out = tmp_path / "climatology.zarr"
-    query = f"COPY ({climatology}) TO '{out}' STORED AS ZARR OPTIONS ('chunks' '24,5,6')"
+    query = f"COPY ({climatology}) TO '{out}' STORED AS ZARR OPTIONS ('chunks' '{chunks}')"
     tables = {"era5": era5_pencils}
     settings = {**LOCAL, "chunks_per_invocation": SHAPE[0] // PENCILS[0]}
 
@@ -432,15 +436,89 @@ def test_the_final_aggregate_runs_on_the_workers_when_the_key_holds_the_outer_co
     assert ("AggregateExec: mode=Final," in fragment) == on_the_workers
 
 
-def test_a_zarr_copy_whose_chunks_span_tiles_is_refused(tmp_path):
+HOURLY_FIELD = (
+    "SELECT time, latitude, longitude, avg(t2m) AS t2m FROM era5 GROUP BY time, latitude, longitude"
+)
+
+
+def copy_hourly_field(out, chunks, where=""):
+    field = HOURLY_FIELD.replace("FROM era5", f"FROM era5 {where}")
+    return f"COPY ({field}) TO '{out}' STORED AS ZARR OPTIONS ('chunks' '{chunks}')"
+
+
+def output_runs(fragments_and_inputs):
+    """Each invocation's `(start, end)` hours of the source, merged."""
+    [(_, inputs)] = fragments_and_inputs
+    runs = []
+    for i in inputs:
+        ranges = sorted(tuple(spec["outer"]["Range"]) for spec in json.loads(i))
+        runs.append((ranges[0][0], ranges[-1][1]))
+    return sorted(runs)
+
+
+@pytest.mark.parametrize(
+    ("chunks", "boundaries"),
+    [
+        # dealt as the source is, 7 chunks of 31 hours an invocation
+        ("31,19,36", list(range(0, SHAPE[0], 7 * 31))),
+        # a day straddles the source's chunks, so invocations take 9 whole days
+        ("24,19,36", list(range(0, SHAPE[0], 9 * 24))),
+    ],
+)
+def test_a_field_by_hour_is_written_on_the_workers_a_whole_output_chunk_each(
+    tmp_path, era5_metadata, chunks, boundaries
+):
+    s = session({"era5": era5_metadata}, **LOCAL, chunks_per_invocation=7)
+    query = copy_hourly_field(tmp_path / "out.zarr", chunks)
+
+    [fragment] = s.explain_fragments(query)
+    assert "ZarrDataSink" in fragment
+    assert [start for start, _ in output_runs(s.fragments(query))] == boundaries
+
+
+FROM_MIDDAY = (
+    "WHERE time >= TIMESTAMP '1979-01-15 03:00:00' AND time < TIMESTAMP '1979-03-01 00:00:00'"
+)
+
+
+@pytest.mark.lambda_integration
+@pytest.mark.parametrize(
+    ("chunks", "where"),
+    [("31,19,36", ""), ("24,19,36", ""), ("24,19,36", FROM_MIDDAY)],
+    ids=["source-chunks", "days", "days-from-a-window"],
+)
+def test_a_zarr_copy_of_a_field_by_hour_matches_the_source(era5, tmp_path, chunks, where):
+    out = tmp_path / "out.zarr"
+    query = copy_hourly_field(out, chunks, where)
+    run(query, {"era5": era5}, **LOCAL, chunks_per_invocation=7)
+
+    source = xr.open_zarr(location(era5), consolidated=False)
+    if where:
+        source = source.sel(time=slice("1979-01-15T03", "1979-02-28T23"))
+    written = xr.open_zarr(out, consolidated=False)
+    np.testing.assert_array_equal(written.time.values, source.time.values)
+    np.testing.assert_allclose(written.t2m.values, source.t2m.values, rtol=1e-6)
+
+
+def test_a_zarr_copy_whose_chunks_span_tiles_is_dealt_a_whole_output_box_each(tmp_path):
     write_group(tmp_path / "era5", with_values=False, chunks=PENCILS)
     out = tmp_path / "climatology.zarr"
     # a chunk of 10 latitudes spans two tiles of 5
     query = f"COPY ({GLOBAL_CLIMATOLOGY}) TO '{out}' STORED AS ZARR OPTIONS ('chunks' '24,10,6')"
     settings = {**LOCAL, "chunks_per_invocation": SHAPE[0] // PENCILS[0]}
+    s = session({"era5": (tmp_path / "era5").as_uri()}, **settings)
 
-    with pytest.raises(RuntimeError, match="two workers would write one"):
-        session({"era5": (tmp_path / "era5").as_uri()}, **settings).explain_fragments(query)
+    [fragment] = s.explain_fragments(query)
+    [(_, inputs)] = s.fragments(query)
+
+    assert "ZarrDataSink" in fragment
+    # one box an invocation, through all of time, compacted into one spec
+    specs = [json.loads(i) for i in inputs]
+    assert all(len(spec) == 1 for spec in specs)
+    boxes = [{coord: tuple(r["Range"]) for coord, r in spec["extra"]} for [spec] in specs]
+    assert sorted({box[1] for box in boxes}) == [(0, 10), (10, 19)]
+    assert sorted({box[2] for box in boxes}) == [(x, x + 6) for x in range(0, 36, 6)]
+    assert len(boxes) == 2 * 6
 
 
 @pytest.mark.parametrize(("chunks_per_invocation", "on_the_workers"), [(6, True), (4, False)])
