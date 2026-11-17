@@ -28,9 +28,9 @@ This project is set up for running benchmarks, it is not a general purpose SQL e
 
 ## Dependencies
 
-map-lambda is pinned to a release, `v0.1.0.dev1`: `map-lambda==0.1.0.dev1`
-for Python, and its tag for the Rust crates and the dispatcher, so that the
-client and dispatcher come from the same build. zarr-datafusion is built
+map-lambda is pinned to a release, 0.1.0: `map-lambda==0.1.0` from PyPI
+for Python, and its tag, `v0.1.0`, for the Rust crates and the dispatcher, so
+that the client and dispatcher come from the same release. zarr-datafusion is built
 from a pinned commit on GitHub.
 
 zarr-datafusion comes from the `lambda-zarr-write` branch of a fork,

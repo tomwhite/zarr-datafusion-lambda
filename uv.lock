@@ -425,8 +425,13 @@ wheels = [
 
 [[package]]
 name = "map-lambda"
-version = "0.1.0.dev1"
-source = { git = "https://github.com/tomwhite/map-lambda?tag=v0.1.0.dev1#e074d4c7dbce2be6ccf235741cf6dddc85176606" }
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/8a/0d60290e491c235f445d10935545fef67e60ad57f27f1e25998f9e52a488/map_lambda-0.1.0-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:f7a9b74edf66b9ebe8a905881e45d73c2ea7044fa57449b08a980eacc462dde7", size = 6329768, upload-time = "2026-11-11T13:04:51.554Z" },
+    { url = "https://files.pythonhosted.org/packages/73/8a/2f37793cea57608b77c14449bb3982893ac639fa237d582bea54503409d9/map_lambda-0.1.0-cp312-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:d7c24d0be0ba015955164b1ba53d831568a99a27b91b3aab5c1732b24c621e83", size = 7394786, upload-time = "2026-11-11T13:04:53.33Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/15/816cd8d8da0ce73c0aad36ebb1d00cf2a54d4b86c3215de347df1da4be2d/map_lambda-0.1.0-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:6107cddbbdf60110f6f41dddee020d371d6a495ce41726e0278fa36dd2c6409d", size = 7141236, upload-time = "2026-11-11T13:04:54.916Z" },
+]
 
 [package.optional-dependencies]
 deploy = [
@@ -1029,7 +1034,7 @@ dev = [
 requires-dist = [
     { name = "boto3", specifier = ">=1.40.61" },
     { name = "click", specifier = ">=8.1" },
-    { name = "map-lambda", extras = ["deploy"], git = "https://github.com/tomwhite/map-lambda?tag=v0.1.0.dev1" },
+    { name = "map-lambda", extras = ["deploy"], specifier = "==0.1.0" },
     { name = "numpy" },
     { name = "pyarrow" },
     { name = "tqdm" },
@@ -1039,7 +1044,7 @@ requires-dist = [
 dev = [
     { name = "datafusion", specifier = ">=55.0.0" },
     { name = "icechunk", specifier = ">=2" },
-    { name = "map-lambda", extras = ["diagnostics"], git = "https://github.com/tomwhite/map-lambda?tag=v0.1.0.dev1" },
+    { name = "map-lambda", extras = ["diagnostics"] },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.16.5" },
     { name = "zarr", specifier = ">=3" },
