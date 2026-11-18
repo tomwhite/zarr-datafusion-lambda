@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use datafusion::arrow::array::{AsArray, UInt64Array};
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::datatypes::UInt64Type;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -113,6 +113,11 @@ extensions_options! {
         /// worker's rows stream back, which Lambda holds to 2 MB/s a
         /// dispatcher after its first 6 MB.
         pub combine: bool, default = true
+        /// The most a join's table read from files may take in memory, decoded,
+        /// for every worker to read it whole and join its chunks with it: well
+        /// under a worker's memory, which holds its chunks in flight too.
+        // TODO: measure against a worker's memory.
+        pub broadcast_bytes: usize, default = 400 * 1024 * 1024
     }
 }
 
@@ -186,8 +191,8 @@ pub fn session(fan_out: Arc<FanOut>, target_partitions: Option<usize>) -> Sessio
     ctx
 }
 
-/// A Zarr table's location, and its zarr-datafusion options, such as the
-/// `group` to read in an icechunk repo.
+/// A table's location, and its options: zarr-datafusion's, such as the `group`
+/// to read in an icechunk repo, or a `format` other than Zarr, such as `PARQUET`.
 #[derive(Clone, Debug, Default)]
 pub struct Table {
     pub location: String,
@@ -197,14 +202,18 @@ pub struct Table {
 impl Table {
     fn create(&self, name: &str) -> String {
         let quoted = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let mut options = self.options.clone();
+        let format = options
+            .remove("format")
+            .unwrap_or_else(|| "ZARR".to_string());
         let mut sql = format!(
-            "CREATE EXTERNAL TABLE \"{}\" STORED AS ZARR LOCATION {}",
+            "CREATE EXTERNAL TABLE \"{}\" STORED AS {} LOCATION {}",
             name.replace('"', "\"\""),
+            format,
             quoted(&self.location)
         );
-        if !self.options.is_empty() {
-            let options = self
-                .options
+        if !options.is_empty() {
+            let options = options
                 .iter()
                 .map(|(key, value)| format!("{} {}", quoted(key), quoted(value)))
                 .collect::<Vec<_>>();
@@ -214,7 +223,7 @@ impl Table {
     }
 }
 
-/// Register each Zarr table by name.
+/// Register each table by name.
 pub async fn register(ctx: &SessionContext, tables: &HashMap<String, Table>) -> Result<()> {
     for (name, table) in tables {
         ctx.sql(&table.create(name)).await?;
@@ -264,9 +273,12 @@ impl PhysicalOptimizerRule for FanOutRule {
             return Ok(plan);
         }
         let combine = options.is_none_or(|options| options.combine);
+        let broadcast_bytes = options.map_or(LambdaOptions::default().broadcast_bytes, |options| {
+            options.broadcast_bytes
+        });
         let plan = plan
             .transform_up(|node| {
-                let exec = match self.cut(&node, combine)? {
+                let exec = match self.cut(&node, combine, broadcast_bytes)? {
                     Some(exec) => Some(exec),
                     None => match finish(&node)? {
                         Some(exec) => Some(exec),
@@ -303,6 +315,7 @@ impl FanOutRule {
         &self,
         node: &Arc<dyn ExecutionPlan>,
         combine: bool,
+        broadcast_bytes: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let Some(partial) = node
             .downcast_ref::<AggregateExec>()
@@ -310,7 +323,7 @@ impl FanOutRule {
         else {
             return Ok(None);
         };
-        let Some(scan) = chunkwise_scan(node) else {
+        let Some(scan) = chunkwise_scan(node, broadcast_bytes) else {
             return Ok(None);
         };
         let Some(chunks) = chunks(scan) else {
@@ -461,13 +474,13 @@ fn without_round_robin(fragment: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn Execu
 /// row by row, so that a worker given some chunks computes exactly their share
 /// of the partial states. A join counts when every worker can be sent its
 /// build side whole.
-fn chunkwise_scan(partial: &Arc<dyn ExecutionPlan>) -> Option<&ZarrExec> {
+fn chunkwise_scan(partial: &Arc<dyn ExecutionPlan>, broadcast_bytes: usize) -> Option<&ZarrExec> {
     let mut node = *partial.children().first()?;
     loop {
         if let Some(scan) = node.downcast_ref::<ZarrExec>() {
             return Some(scan);
         }
-        if let Some(probe) = broadcast_probe(node) {
+        if let Some(probe) = broadcast_probe(node, broadcast_bytes) {
             node = probe;
             continue;
         }
@@ -568,7 +581,7 @@ fn scan_left_here(
             } else {
                 "a Zarr scan is joined with a side that can't be sent to every worker: that \
                  needs an inner join, and on its build side rows held in memory, at most \
-                 1 MB, or files, at most 64 MB"
+                 1 MB, or files whose rows take at most lambda.broadcast_bytes in memory"
                     .to_string()
             };
         }
@@ -600,20 +613,19 @@ fn contains_fan_out(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.is::<MapLambdaZarrExec>() || plan.children().into_iter().any(contains_fan_out)
 }
 
-/// The most a broadcast build side may hold in memory, which travels in the
-/// fragment, in every dispatcher's request, under Lambda's 6 MB request limit.
-const BROADCAST_BYTES: usize = 1024 * 1024;
-
-/// The most a broadcast build side may read from files, which every worker reads
-/// whole and holds while it joins its chunks.
-// TODO: measure against a worker's memory.
-const BROADCAST_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// The most a broadcast build side of rows held here may hold, which travel in
+/// the fragment, in every dispatcher's request, under Lambda's 6 MB request
+/// limit.
+const BROADCAST_ROWS_BYTES: usize = 1024 * 1024;
 
 /// The probe side of an inner join whose build side every worker can be sent
 /// whole. An inner join matches each probe row against the whole build side
 /// alone, so it works row by row on the probe side; an outer join would repeat
 /// its unmatched build rows on every worker.
-fn broadcast_probe(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
+fn broadcast_probe(
+    node: &Arc<dyn ExecutionPlan>,
+    broadcast_bytes: usize,
+) -> Option<&Arc<dyn ExecutionPlan>> {
     let (join_type, build, probe) = if let Some(join) = node.downcast_ref::<NestedLoopJoinExec>() {
         (join.join_type(), join.left(), join.right())
     } else {
@@ -622,12 +634,13 @@ fn broadcast_probe(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPl
             .filter(|j| *j.partition_mode() == PartitionMode::CollectLeft)?;
         (join.join_type(), join.left(), join.right())
     };
-    (*join_type == JoinType::Inner && broadcastable(build)).then_some(probe)
+    (*join_type == JoinType::Inner && broadcastable(build, broadcast_bytes)).then_some(probe)
 }
 
 /// Whether `build` reads only rows held here, few enough to travel in the
-/// fragment, or files, few enough for every worker to read whole itself.
-fn broadcastable(build: &Arc<dyn ExecutionPlan>) -> bool {
+/// fragment, or files whose rows take at most `broadcast_bytes` in memory, for
+/// every worker to read whole itself.
+fn broadcastable(build: &Arc<dyn ExecutionPlan>, broadcast_bytes: usize) -> bool {
     let Some(source) = source_under(build) else {
         return false;
     };
@@ -639,18 +652,38 @@ fn broadcastable(build: &Arc<dyn ExecutionPlan>) -> bool {
             .flatten()
             .map(RecordBatch::get_array_memory_size)
             .sum();
-        return bytes <= BROADCAST_BYTES;
+        return bytes <= BROADCAST_ROWS_BYTES;
     }
-    data.downcast_ref::<FileScanConfig>().is_some_and(|files| {
-        // a file split into ranges is in several groups, each with its whole size
-        let sizes: HashMap<_, _> = files
-            .file_groups
-            .iter()
-            .flat_map(|group| group.iter())
-            .map(|file| (&file.object_meta.location, file.object_meta.size))
-            .collect();
-        sizes.values().sum::<u64>() <= BROADCAST_FILE_BYTES
-    })
+    data.is::<FileScanConfig>()
+        && decoded_bytes(source).is_some_and(|bytes| bytes <= broadcast_bytes)
+}
+
+/// The bytes `source`'s rows take in memory, from its statistics, if they tell:
+/// decoded, not as stored, as Parquet can encode repetitive columns, such as
+/// regridding weights, dozens of times smaller.
+fn decoded_bytes(source: &DataSourceExec) -> Option<usize> {
+    let stats = source.partition_statistics(None).ok()?;
+    if let Some(&bytes) = stats.total_byte_size.get_value() {
+        return Some(bytes);
+    }
+    // A column the scan computes, such as a join key's cast, has no size of its
+    // own, but a fixed width.
+    let rows = *stats.num_rows.get_value()?;
+    let schema = source.schema();
+    stats
+        .column_statistics
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            column.byte_size.get_value().copied().or_else(|| {
+                let width = match field.data_type() {
+                    DataType::Dictionary(key, _) => key.primitive_width(),
+                    other => other.primitive_width(),
+                };
+                Some(rows * width?)
+            })
+        })
+        .sum()
 }
 
 /// The source `plan` reads, if it reads only one, through nodes that pass its

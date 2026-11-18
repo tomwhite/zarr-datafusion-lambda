@@ -4477,7 +4477,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.45",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror",
  "tokio",
  "tracing",
@@ -4516,7 +4516,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -6409,7 +6409,7 @@ dependencies = [
 [[package]]
 name = "zarr-datafusion"
 version = "0.1.1"
-source = "git+https://github.com/tomwhite/zarr-datafusion?rev=5ab21a6#5ab21a66b50c3c5018a9fe2c203db72cdea6a67f"
+source = "git+https://github.com/tomwhite/zarr-datafusion?rev=38402df#38402df89fd7e5fb76aeed09496980a2321d79d1"
 dependencies = [
  "arrow",
  "async-trait",

@@ -15,6 +15,7 @@ were checked:
 | [Zonal mean](docs/benchmarks/zonal-mean.md) | `GROUP BY` latitude, merged in the dispatchers | 1940–2024 | 92s | $2.25 | xarray |
 | [Region statistics](docs/benchmarks/region-statistics.md) | joined with a small table | 1940–2024 | 102s | $2.49 | xarray |
 | [Hourly climatology](docs/benchmarks/climatology.md) | finished and written to Zarr by the workers | 1940–2025 | 136s | $3.07 | xarray |
+| [Regridding](docs/benchmarks/regridding.md) | joined with weights from S3, finished and written to Zarr by the workers | 2015–2024 | 66s | $0.87 | xarray |
 
 ## How it works
 
@@ -38,6 +39,11 @@ partial rows as for the zonal mean.
 For the [climatology](docs/benchmarks/climatology.md), each worker processes
 all of a group's rows, so it runs the final aggregate, and writes the output
 itself.
+
+For [regridding](docs/benchmarks/regridding.md), the weights are a table in
+S3, which each worker reads whole and joins its own chunks with. As for the
+climatology, each worker has all of a group's rows, an hour's, so it finishes
+the aggregate and writes the output itself.
 
 This project is set up for running benchmarks, it is not a general purpose SQL engine.
 

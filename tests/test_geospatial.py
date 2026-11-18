@@ -5,6 +5,7 @@ client, and by xarray, and cut where expected."""
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from operator import itemgetter
 
 import numpy as np
 import pandas as pd
@@ -411,3 +412,32 @@ def test_a_case_is_cut_as_it_should_be(tmp_path, name):
     should, _ = SHOULD[name]
 
     assert cut(tmp_path, CASES[name]) == should
+
+
+REGRIDDING_COPY = """
+COPY (
+    SELECT s.time AS time, w.dst_lat AS lat, w.dst_lon AS lon, sum(s.t2m * w.weight) AS regridded
+    FROM weights w
+    JOIN era5 s ON s.latitude = w.src_lat AND s.longitude = w.src_lon
+    WHERE s.time < TIMESTAMP '1979-01-11 00:00:00'
+    GROUP BY 1, 2, 3
+) TO '{output}' STORED AS ZARR OPTIONS ('chunks' '31,7,12')
+"""
+
+
+@pytest.mark.lambda_integration
+def test_regridding_written_to_zarr_on_the_workers_matches_xarray(tmp_path):
+    case = CASES["regridding"]
+    output = tmp_path / "regridded.zarr"
+
+    _, reports = connect(tmp_path, case).sql(REGRIDDING_COPY.format(output=output))
+
+    [report] = json.loads(reports)
+    assert report["invocations"] > 1
+    written = xr.open_zarr(output, consolidated=False).regridded.to_dataframe().reset_index()
+    rows = [
+        {"time": pd.Timestamp(r.time), "lat": r.lat, "lon": r.lon, "regridded": r.regridded}
+        for r in written.itertuples()
+    ]
+    key = itemgetter("time", "lat", "lon")
+    rows_close(sorted(rows, key=key), reference(tmp_path, case))
