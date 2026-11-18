@@ -2,21 +2,19 @@
 
 How fast can we query ERA5 Zarr data using SQL and the [map-lambda](https://github.com/tomwhite/map-lambda) framework?
 
-**The monthly area-weighted global mean temperature over 85 years of hourly
-ERA5 (745,128 chunks, 3.1 TB uncompressed) takes ~88s and costs ~$2.17**
+**The hourly climatology of every grid cell over the whole hourly ERA5 record,
+1940 to 2025 (3.1 TB uncompressed), written to Zarr on S3, takes ~136s and
+costs ~$3.07**
 
-**The mean temperature of each of the 721 latitudes over the same ERA5 record
-takes ~92s and costs ~$2.25**
+Each benchmark has a page with its query, how it runs, and how its results
+were checked:
 
-**The mean temperature inside each of five continental boxes over the same
-ERA5 record takes ~102s and costs ~$2.49**
-
-**The hourly climatology of every grid cell over the same ERA5 record, written to
-Zarr on S3, takes ~136s and costs ~$3.07**
-
-All four answers match xarray for a sample, and the global means match those
-Copernicus publishes from ERA5 to within 0.001°C for all but one of the ~1000
-months.
+| Benchmark | Shape | Window | Time | Cost | Checked against |
+|---|---|---|---|---|---|
+| [Global mean temperature](docs/benchmarks/global-mean.md) | `GROUP BY` month | 1940–2024 | 88s | $2.17 | xarray, Copernicus |
+| [Zonal mean](docs/benchmarks/zonal-mean.md) | `GROUP BY` latitude, merged in the dispatchers | 1940–2024 | 92s | $2.25 | xarray |
+| [Region statistics](docs/benchmarks/region-statistics.md) | joined with a small table | 1940–2024 | 102s | $2.49 | xarray |
+| [Hourly climatology](docs/benchmarks/climatology.md) | finished and written to Zarr by the workers | 1940–2025 | 136s | $3.07 | xarray |
 
 ## How it works
 
@@ -24,18 +22,22 @@ A query is planned by [DataFusion](https://datafusion.apache.org/), over Zarr
 arrays flattened into tables by [zarr-datafusion](https://github.com/stratoscale-io/zarr-datafusion).
 
 A new physical operator `MapLambdaZarrExec` is used to run partial
-aggregates on Lambda workers. For the global means, the partial aggregate results
-for each worker are streamed back to the client which completes the rest of the plan.
+aggregates on Lambda workers. For the [global
+mean](docs/benchmarks/global-mean.md), the partial aggregate results for each
+worker are streamed back to the client which completes the rest of the plan.
 
-For the zonal mean, every worker returns a partial row for every latitude, so
-the dispatchers merge them as they arrive and send the client one state each.
+For the [zonal mean](docs/benchmarks/zonal-mean.md), every worker returns a
+partial row for every latitude, so the dispatchers merge them as they arrive
+and send the client one state each.
 
-For the region statistics, the boxes are a small table joined with the
-scan. Each worker is sent the table in its fragment and joins its own chunks
-with it, and the dispatchers merge the partial rows as for the zonal mean.
+For the [region statistics](docs/benchmarks/region-statistics.md), the boxes
+are a small table joined with the scan. Each worker is sent the table in its
+fragment and joins its own chunks with it, and the dispatchers merge the
+partial rows as for the zonal mean.
 
-For the climatology, each worker processes all of a group's rows, so it runs
-the final aggregate, and writes the output itself.
+For the [climatology](docs/benchmarks/climatology.md), each worker processes
+all of a group's rows, so it runs the final aggregate, and writes the output
+itself.
 
 This project is set up for running benchmarks, it is not a general purpose SQL engine.
 
@@ -46,9 +48,8 @@ tag for the Rust crates and the dispatchers, so that the client and
 dispatchers come from the same release. zarr-datafusion is built
 from a pinned commit on GitHub.
 
-zarr-datafusion comes from the `lambda-zarr-write` branch of a fork,
-<https://github.com/tomwhite/zarr-datafusion>, pinned to a commit, until its
-Zarr writes are merged upstream.
+zarr-datafusion comes from a fork, <https://github.com/tomwhite/zarr-datafusion>,
+pinned to a commit, until the changes it carries are merged upstream.
 
 ## Running locally
 
@@ -166,230 +167,9 @@ From a checkout, with the package built from source:
 uv run --with jupyterlab --with ipywidgets --with pandas jupyter lab examples/query.ipynb
 ```
 
-Each benchmark below runs from a checkout, which builds the client from
-source, and saves its run to `results/`, with a timeline of its invocations.
-
-## Global mean temperature
-
-`benchmarks/demo.py` computes the monthly area-weighted global mean of `t2m`
-over [Earthmover's ERA5](https://registry.opendata.aws/earthmover-era5/),
-dataset in Icechunk format. The full dataset goes back to 1940, but the
-script accepts a time range to allow you to query part of it.
-
-Start with a few months to check everything is working properly:
-
-```shell
-uv run python benchmarks/demo.py --start 2020-01-01 --end 2020-04-01
-```
-
-It should complete in a few seconds.
-
-Then run the whole dataset, which costs about $2. The concurrency leaves room
-under the account's default limit of 1,000:
-
-```shell
-uv run python benchmarks/demo.py --start 1940-01-01 --end 2025-01-01 --concurrency 990
-```
-
-In one run, the 1,020 months took 88.2s and cost approximately $2.17:
-31,047 invocations of 24 hourly chunks.
-
-<img src="./era5-1940-2024-c990-timeline.svg">
-
-### Checking the results
-
-```shell
-# one month against xarray, reading about 3 GB from us-east-1
-uv run benchmarks/demo_check.py $(ls results/demo-*.json | tail -1) --month 2020-02
-# every month against Copernicus's published daily means, charted beside the run
-uv run python benchmarks/copernicus_check.py $(ls results/demo-*.json | tail -1)
-```
-
-The month matches xarray to 9 decimal places, with identical extremes. Every
-month from 1940 to 2022 agrees with Copernicus within about 0.0006°C, which
-rounds each day to 0.001°C. Earthmover's copy of 2023 and 2024 differs a
-little more, up to 0.0013°C in July 2024. This discrepancy was not explored further.
-
-<img src="./era5-1940-2024-copernicus.svg">
-
-### The plan
-
-`--explain` prints the query's physical plan, then the fragment that each
-fan-out sends to the workers. It doesn't run the query.
-
-```shell
-uv run python benchmarks/demo.py --start 1940-01-01 --end 2025-01-01 --concurrency 990 --explain
-```
-
-The client runs everything down to the `MapLambdaZarrExec`, which stands in
-for the partial aggregate and the scan below it: its 745,128 chunks, those of
-the window that pruning kept, go to 31,047 invocations of 24.
-
-```
-SortPreservingMergeExec: [month@0 ASC NULLS LAST]
-  SortExec: expr=[month@0 ASC NULLS LAST], preserve_partitioning=[true]
-    ProjectionExec: expr=[date_trunc(Utf8("month"),era5.valid_time)@0 as month, sum(era5.t2m * cos(radians(era5.latitude)))@1 / sum(cos(radians(era5.latitude)))@2 as mean_t2m, min(era5.t2m)@3 as min_t2m, max(era5.t2m)@4 as max_t2m, count(Int64(1))@5 as n]
-      AggregateExec: mode=FinalPartitioned, gby=[date_trunc(Utf8("month"),era5.valid_time)@0 as date_trunc(Utf8("month"),era5.valid_time)], aggr=[sum(era5.t2m * cos(radians(era5.latitude))), sum(cos(radians(era5.latitude))), min(era5.t2m), max(era5.t2m), count(Int64(1))]
-        RepartitionExec: partitioning=Hash([date_trunc(Utf8("month"),era5.valid_time)@0], 8), input_partitions=1
-          MapLambdaZarrExec: function=fragment, chunks=745128, invocations=31047
-
-fragment:
-AggregateExec: mode=Partial, gby=[date_trunc(month, CAST(valid_time@1 AS Timestamp(ns))) as date_trunc(Utf8("month"),era5.valid_time)], aggr=[sum(era5.t2m * cos(radians(era5.latitude))), sum(cos(radians(era5.latitude))), min(era5.t2m), max(era5.t2m), count(Int64(1))]
-  ProjectionExec: expr=[cos(radians(CAST(latitude@1 AS Float64))) as __common_expr_1, valid_time@0 as valid_time, t2m@2 as t2m]
-    FilterExec: valid_time@0 >= -946771200000000 AND valid_time@0 < 1735689600000000
-      ZarrExec: path=s3://earthmover-icechunk-era5/icechunkV2, filters=[valid_time BETWEEN -946771200000000 AND 1735689600000000]
-```
-
-Each worker binds the fragment's `ZarrExec` to its own chunks, and returns
-one partial row per month it touches.
-
-## Zonal mean
-
-`benchmarks/zonal_mean.py` computes the mean `t2m` of each of the 721
-latitudes, over the same ERA5 as the global mean:
-
-```sql
-SELECT latitude, avg(t2m) - 273.15 AS air_mean_c, count(*) AS n
-FROM era5
-WHERE valid_time >= TIMESTAMP '{start}' AND valid_time < TIMESTAMP '{end}'
-GROUP BY latitude
-ORDER BY latitude DESC
-```
-
-Every invocation returns a partial row for every latitude, 35 KB, so the
-partial rows grow with the invocations rather than with the answer. The
-dispatchers merge them as they arrive, through the
-`dispatcher-partial-reduce` function, and send the client one state each.
-
-By default it runs over a month:
-
-```shell
-uv run python benchmarks/zonal_mean.py
-```
-
-Then the whole record, which costs about $2.25:
-
-```shell
-uv run python benchmarks/zonal_mean.py --start 1940-01-01 --end 2025-01-01
-```
-
-In one run, the whole record took 92.2s and cost approximately $2.25: 31,047
-invocations of 24 hourly chunks, merged into one state by one dispatcher.
-
-<img src="./era5-zonal-mean-c990-timeline.svg">
-
-### Checking the results
-
-```shell
-# every latitude of a month's run against xarray, reading about 3 GB from us-east-1
-uv run benchmarks/zonal_mean_check.py results/zonal-mean-<a month's run>.json
-```
-
-A month's run matches xarray to within 1e-6°C at every latitude.
-
-## Region statistics
-
-`benchmarks/region_statistics.py` computes the mean `t2m` inside each of five
-continental boxes, over the same ERA5 as the global mean:
-
-```sql
-SELECT r.region, avg(a.t2m) - 273.15 AS avg_c, count(*) AS n
-FROM (VALUES ('Amazon', -10.0, 5.0, 290.0, 310.0),
-             ('Australia_Outback', -30.0, -20.0, 125.0, 140.0),
-             ('Greenland', 65.0, 80.0, 300.0, 340.0),
-             ('SE_Asia', 5.0, 20.0, 95.0, 110.0),
-             ('Sahara', 18.0, 30.0, 0.0, 30.0)) AS r(region, south, north, west, east)
-JOIN era5 a
-  ON a.latitude BETWEEN r.south AND r.north AND a.longitude BETWEEN r.west AND r.east
-WHERE a.valid_time >= TIMESTAMP '{start}' AND a.valid_time < TIMESTAMP '{end}'
-GROUP BY r.region
-ORDER BY r.region
-```
-
-The boxes are a small table, so every worker is sent it in its fragment and
-joins its own chunks with it. They are written first: DataFusion holds the
-table written first in memory and streams the other past it, so written the
-other way round, the raster would be held in memory and the query would not
-fan out. Every invocation returns a partial row for every box, which the
-dispatchers merge as for the zonal mean.
-
-By default it runs over a month:
-
-```shell
-uv run python benchmarks/region_statistics.py
-```
-
-Then the whole record, which costs about $2.50:
-
-```shell
-uv run python benchmarks/region_statistics.py --start 1940-01-01 --end 2025-01-01
-```
-
-In one run, the whole record took 101.6s and cost approximately $2.49: 31,047
-invocations of 24 hourly chunks, merged into one state by one dispatcher.
-
-### Checking the results
-
-```shell
-# every box of a month's run against xarray, reading about 3 GB from us-east-1
-uv run benchmarks/region_statistics_check.py results/region-statistics-<a month's run>.json
-```
-
-A month's run matches xarray exactly in every box.
-
-## Hourly climatology
-
-`benchmarks/climatology.py` computes the mean `t2m` of every grid cell for
-each hour of the day, over the same ERA5 in its time-series layout
-(`single/temporal`), where a chunk is a "pencil": a year of hours (8,736) over
-a 12 x 12 tile. The output is 24 x 721 x 1440 cells, written by the workers to
-a Zarr store with a chunk a tile:
-
-```sql
-COPY (
-  SELECT latitude, longitude,
-         date_part('hour', CAST(valid_time AS TIMESTAMP)) AS hour,
-         avg(t2m) AS clim, count(*) AS n
-  FROM era5
-  WHERE valid_time >= TIMESTAMP '{start}' AND valid_time < TIMESTAMP '{end}'
-  GROUP BY 1, 2, 3
-) TO 's3://<bucket>/climatology.zarr' STORED AS ZARR OPTIONS ('chunks' '24,12,12')
-```
-
-Each of the 7,320 invocations takes one tile's whole stack of pencils, so its
-rows are final: it finishes the aggregate, writes its tile's chunk, and
-returns only a count.
-
-By default it runs over a week, which is useful for checking it works first
-(costs about $0.12).
-
-```shell
-uv run python benchmarks/climatology.py s3://<bucket>/climatology-week.zarr
-```
-
-Then the whole record:
-
-```shell
-uv run python benchmarks/climatology.py s3://<bucket>/climatology.zarr --start 1940-01-01 --end 2026-01-01
-```
-
-In one run, the whole record took 135.8s and cost approximately $3.07: 7,320
-invocations of 87 pencils, in about 7.4 waves at a concurrency of 990. The
-cost includes about $0.07 for the workers' ~14,640 writes to the output, which
-the run's report leaves out.
-
-<img src="./era5-climatology-c990-timeline.svg">
-
-### Checking the results
-
-```shell
-# one tile, 57.25 to 60°N and 0 to 2.75°E, against xarray reading the same pencils
-uv run --with xarray --with "numcodecs[pcodec]" --with obstore python benchmarks/climatology_check.py \
-  --output s3://<bucket>/climatology.zarr --start 1940-01-01 --end 2026-01-01
-```
-
-The tile matches xarray exactly. The check reads the tile's chunk alone, in
-about 2 seconds.
+Each [benchmark](#zarr-datafusion-lambda) runs from a checkout, which builds
+the client from source, and saves its run to `results/`, with a timeline of
+its invocations.
 
 ## Releasing
 
