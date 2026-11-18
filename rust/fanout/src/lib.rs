@@ -24,8 +24,9 @@ use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::expressions::{CastExpr, Column, TryCastExpr};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -306,7 +307,7 @@ impl FanOutRule {
             by_tile(chunks, per_invocation)
         } else {
             let runs = chunks.chunks(per_invocation).map(<[_]>::to_vec).collect();
-            (runs, false)
+            (runs, groups_within_chunks(partial, scan, &chunks))
         };
         let mut exec = MapLambdaZarrExec::new(
             without_round_robin(node.clone())?,
@@ -618,6 +619,42 @@ fn groups_within_tiles(partial: &AggregateExec, scan: &ZarrExec, chunks: &[Parti
                 .get(*coord)
                 .is_some_and(|c| keys.contains(&c.name.as_str()))
         })
+}
+
+/// Whether the partial aggregate groups by the outer coordinate, or a cast of
+/// it, over chunks cut along no other axis. Each of the coordinate's values
+/// then lies in one chunk, so no group spans two, however they are dealt.
+fn groups_within_chunks(
+    partial: &AggregateExec,
+    scan: &ZarrExec,
+    chunks: &[PartitionSpec],
+) -> bool {
+    let Some(outer) = scan
+        .store_meta()
+        .and_then(|meta| meta.data_vars.first())
+        .and_then(|var| var.dimensions.as_ref()?.first())
+    else {
+        return false;
+    };
+    partial.group_expr().is_single()
+        && chunks.iter().all(|spec| spec.extra.is_empty())
+        && partial
+            .group_expr()
+            .expr()
+            .iter()
+            .any(|(expr, _)| column_name(expr) == Some(outer.as_str()))
+}
+
+/// The column `expr` reads, if it is one, or a cast of one.
+fn column_name(expr: &Arc<dyn PhysicalExpr>) -> Option<&str> {
+    if let Some(column) = expr.downcast_ref::<Column>() {
+        return Some(column.name());
+    }
+    let inner = match expr.downcast_ref::<CastExpr>() {
+        Some(cast) => cast.expr(),
+        None => expr.downcast_ref::<TryCastExpr>()?.expr(),
+    };
+    column_name(inner)
 }
 
 /// `chunks` dealt a tile at a time, through time, in runs of at most
