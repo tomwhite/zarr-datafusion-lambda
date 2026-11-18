@@ -26,8 +26,9 @@ def location(url: str) -> str:
 
 
 Table = str | dict[str, str]
-"""A Zarr group's URL, or a dict of its `url` and zarr-datafusion's table
-options, such as the `group` to read in an icechunk repo."""
+"""A Zarr group's URL, or a dict of a table's `url` and its options:
+zarr-datafusion's, such as the `group` to read in an icechunk repo, or a
+`format` other than Zarr, such as `parquet`."""
 
 
 def _table(table: Table) -> tuple[str, dict[str, str]]:

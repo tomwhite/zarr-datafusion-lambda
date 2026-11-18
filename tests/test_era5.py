@@ -634,7 +634,7 @@ ORDER BY a.latitude
 """
 
 
-def with_lookup(s, path, rows, **options):
+def with_lookup(s, path, rows):
     """`s` with a Parquet table `lookup` of `rows` weights on the grid's cells, at `path`."""
     rng = np.random.default_rng(0)
     latitudes = 90.0 - 180.0 * np.arange(SHAPE[1]) / (SHAPE[1] - 1)
@@ -646,7 +646,7 @@ def with_lookup(s, path, rows, **options):
             "weight": rng.random(rows),
         }
     )
-    pq.write_table(table, path, **options)
+    pq.write_table(table, path)
     s.sql(f"CREATE EXTERNAL TABLE lookup STORED AS PARQUET LOCATION '{path}'")
     return s
 
@@ -667,16 +667,13 @@ def test_a_join_with_a_parquet_table_fans_out_with_its_files_in_the_fragment(
 def test_a_join_with_a_parquet_table_too_big_for_every_worker_is_refused(
     era5_metadata, tmp_path
 ):
-    # about 70 MB uncompressed
+    # 300,000 rows of three float64s, 7.2 MB in memory, however small its file
+    limit = {"lambda.broadcast_bytes": str(1_000_000)}
     s = with_lookup(
-        session({"era5": era5_metadata}, **LOCAL),
-        tmp_path / "w.parquet",
-        2_900_000,
-        compression="none",
-        use_dictionary=False,
+        session({"era5": era5_metadata}, **LOCAL, config=limit), tmp_path / "w.parquet", 300_000
     )
 
-    with pytest.raises(RuntimeError, match="can't be sent to every worker"):
+    with pytest.raises(RuntimeError, match=r"lambda\.broadcast_bytes"):
         s.fragments(LOOKUP_JOIN)
 
 
