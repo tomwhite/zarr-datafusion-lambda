@@ -4,6 +4,7 @@ from operator import itemgetter
 import datafusion
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import xarray as xr
 import zarr
@@ -622,6 +623,83 @@ def test_a_join_that_cant_be_broadcast_is_refused(era5_metadata, joined, why):
 
     with pytest.raises(RuntimeError, match=why):
         s.fragments(by_region(joined))
+
+
+LOOKUP_JOIN = """
+SELECT a.latitude, sum(a.t2m * w.weight) AS weighted, count(*) AS n
+FROM lookup w
+JOIN era5 a ON a.latitude = w.lat AND a.longitude = w.lon
+GROUP BY a.latitude
+ORDER BY a.latitude
+"""
+
+
+def with_lookup(s, path, rows, **options):
+    """`s` with a Parquet table `lookup` of `rows` weights on the grid's cells, at `path`."""
+    rng = np.random.default_rng(0)
+    latitudes = 90.0 - 180.0 * np.arange(SHAPE[1]) / (SHAPE[1] - 1)
+    longitudes = 360.0 * np.arange(SHAPE[2]) / SHAPE[2]
+    table = pa.table(
+        {
+            "lat": rng.choice(latitudes, rows),
+            "lon": rng.choice(longitudes, rows),
+            "weight": rng.random(rows),
+        }
+    )
+    pq.write_table(table, path, **options)
+    s.sql(f"CREATE EXTERNAL TABLE lookup STORED AS PARQUET LOCATION '{path}'")
+    return s
+
+
+# more rows than DataFusion collects a join's build side for by default
+@pytest.mark.parametrize("rows", [1_000, 300_000])
+def test_a_join_with_a_parquet_table_fans_out_with_its_files_in_the_fragment(
+    era5_metadata, tmp_path, rows
+):
+    s = with_lookup(session({"era5": era5_metadata}, **LOCAL), tmp_path / "w.parquet", rows)
+
+    assert len(s.fragments(LOOKUP_JOIN)) == 1
+    [fragment] = s.explain_fragments(LOOKUP_JOIN)
+    assert "HashJoinExec: mode=CollectLeft" in fragment
+    assert "file_type=parquet" in fragment
+
+
+def test_a_join_with_a_parquet_table_too_big_for_every_worker_is_refused(
+    era5_metadata, tmp_path
+):
+    # about 70 MB uncompressed
+    s = with_lookup(
+        session({"era5": era5_metadata}, **LOCAL),
+        tmp_path / "w.parquet",
+        2_900_000,
+        compression="none",
+        use_dictionary=False,
+    )
+
+    with pytest.raises(RuntimeError, match="can't be sent to every worker"):
+        s.fragments(LOOKUP_JOIN)
+
+
+def test_a_join_with_a_local_parquet_table_is_refused_for_real_lambdas(era5_metadata, tmp_path):
+    s = with_lookup(session({"era5": era5_metadata}), tmp_path / "w.parquet", 1_000)
+
+    with pytest.raises(RuntimeError, match="reads local files, which the workers can't"):
+        s.sql(LOOKUP_JOIN)
+
+
+@pytest.mark.lambda_integration
+def test_a_join_with_a_parquet_table_with_lambdas_matches_one_process(era5, tmp_path):
+    path = tmp_path / "w.parquet"
+    s = with_lookup(session({"era5": era5}, **LOCAL), path, 300_000)
+    stream, reports = s.sql(LOOKUP_JOIN)
+    disabled = with_lookup(session({"era5": era5}, **LOCAL, config=DISABLED), path, 300_000)
+    expected, _ = disabled.sql(LOOKUP_JOIN)
+
+    assert json.loads(reports)[0]["chunks"]
+    rows_close(
+        pa.ipc.open_stream(stream).read_all().to_pylist(),
+        pa.ipc.open_stream(expected).read_all().to_pylist(),
+    )
 
 
 # TODO: CAST(time AS TIMESTAMP) because zarr-datafusion's time is UTC, and the

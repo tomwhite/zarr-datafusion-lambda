@@ -13,10 +13,11 @@ datafusion = "54.0.0"
 datafusion-proto = "54.0.0"
 futures = "0.3"
 # the version zarr-datafusion's stores are built on
-object_store = "0.13"
+object_store = { version = "0.13", features = ["aws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync"] }
+url = "2"
 # the version zarr-datafusion's stores implement
 zarrs_storage = { version = "0.4", features = ["async"] }
 zarr-datafusion = { git = "https://github.com/stratoscale-io/zarr-datafusion", rev = "8aa1e2f", features = ["icechunk"] }
