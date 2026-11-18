@@ -112,6 +112,9 @@ QUERIES = [
     # only the inner aggregate fans out
     "SELECT max(mean) AS warmest, count(*) AS n FROM "
     "(SELECT latitude, avg(t2m) AS mean FROM era5 GROUP BY latitude)",
+    # each hour lies in one chunk, so the final aggregate runs on the workers
+    "SELECT CAST(time AS TIMESTAMP) AS hour, avg(t2m) AS mean, count(*) AS n "
+    "FROM era5 GROUP BY 1 ORDER BY 1",
 ]
 
 
@@ -407,6 +410,28 @@ def test_a_zarr_copy_of_the_climatology_over_pencils_matches_one_process(
     ]
     key = itemgetter("latitude", "longitude", "hour")
     rows_close(sorted(written, key=key), sorted(expected, key=key))
+
+
+@pytest.mark.parametrize(
+    ("key", "chunks", "on_the_workers"),
+    [
+        ("time", CHUNKS, True),
+        ("CAST(time AS TIMESTAMP)", CHUNKS, True),
+        # a day spans chunks of 31 hours
+        ("date_trunc('day', CAST(time AS TIMESTAMP))", CHUNKS, False),
+        # an hour of the globe spans pencils' tiles
+        ("time", PENCILS, False),
+    ],
+)
+def test_the_final_aggregate_runs_on_the_workers_when_the_key_holds_the_outer_coordinate(
+    tmp_path, key, chunks, on_the_workers
+):
+    write_group(tmp_path, with_values=False, chunks=chunks)
+    query = f"SELECT {key} AS t, avg(t2m) AS mean FROM era5 GROUP BY 1"
+
+    [fragment] = session({"era5": tmp_path.as_uri()}, **LOCAL).explain_fragments(query)
+
+    assert ("AggregateExec: mode=Final," in fragment) == on_the_workers
 
 
 @pytest.mark.parametrize(("chunks_per_invocation", "on_the_workers"), [(6, True), (4, False)])
