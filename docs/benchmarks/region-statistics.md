@@ -49,6 +49,8 @@ uv run python benchmarks/region_statistics.py --start 1940-01-01 --end 2025-01-0
 In one run, the whole record took 101.6s and cost approximately $2.49: 31,047
 invocations of 24 hourly chunks, merged into one state by one dispatcher.
 
+<img src="./region-statistics-timeline.svg">
+
 ## Checking the results
 
 ```shell
