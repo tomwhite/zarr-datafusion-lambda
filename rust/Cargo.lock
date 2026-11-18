@@ -5407,6 +5407,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "url",
  "zarr-datafusion",
  "zarrs_object_store",
  "zarrs_storage",

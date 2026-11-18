@@ -12,6 +12,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 pub use datafusion::error::DataFusionError;
 use datafusion::error::Result;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use datafusion::prelude::SessionContext;
@@ -40,17 +41,23 @@ mod merge;
 mod per_value;
 mod reduce;
 mod requests;
+mod stores;
 
 pub use merge::{merge_partials, partial_reduce};
 pub use per_value::PerValueRule;
 pub use reduce::{encode_reduce, Reduce, COMBINER};
 
-/// A session state that reads Zarr tables, without zarr-datafusion's
-/// `CardinalityRule`: its aggregate pushdown replaces an aggregate with one node
-/// that has no partial form to split at.
+/// A session state that reads Zarr tables, and others from S3, without
+/// zarr-datafusion's `CardinalityRule`: its aggregate pushdown replaces an
+/// aggregate with one node that has no partial form to split at.
 pub fn builder() -> SessionStateBuilder {
+    let runtime = RuntimeEnvBuilder::new()
+        .with_object_store_registry(Arc::new(stores::Registry::default()))
+        .build_arc()
+        .expect("builds");
     SessionStateBuilder::new()
         .with_default_features()
+        .with_runtime_env(runtime)
         .with_table_factory("ZARR".to_string(), Arc::new(ZarrTableFactory))
         .with_optimizer_rule(Arc::new(CountStatisticsRule::new()))
         .with_optimizer_rule(Arc::new(MinMaxStatisticsRule::new()))

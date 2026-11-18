@@ -137,7 +137,7 @@ def region_statistics(ds):
 
 def regridding(ds):
     w = weights().to_pandas()
-    day = ds.t2m.sel(time=FIRST_DAY).astype("float64")
+    day = ds.t2m.sel(time=slice(None, "1979-01-10T23")).astype("float64")
     src = day.sel(
         latitude=xr.DataArray(w.src_lat.values, dims="w"),
         longitude=xr.DataArray(w.src_lon.values, dims="w"),
@@ -248,7 +248,7 @@ FROM era5
 WHERE time = TIMESTAMP '1979-01-01 00:00:00'
 """
 
-# Each hour of a day, as xarray-sql regrids a static field
+# Each hour of ten days, as xarray-sql regrids a static field: 8 chunks
 REGRIDDING = """
 SELECT CAST(s.time AS TIMESTAMP) AS time,
        w.dst_lat                 AS lat,
@@ -256,7 +256,7 @@ SELECT CAST(s.time AS TIMESTAMP) AS time,
        sum(s.t2m * w.weight)     AS regridded
 FROM weights w
 JOIN era5 s ON s.latitude = w.src_lat AND s.longitude = w.src_lon
-WHERE s.time < TIMESTAMP '1979-01-02 00:00:00'
+WHERE s.time < TIMESTAMP '1979-01-11 00:00:00'
 GROUP BY 1, 2, 3
 ORDER BY 1, 2, 3
 """
@@ -277,7 +277,7 @@ CASES = {
     "persistence-skill": Case(PERSISTENCE_SKILL, None, persistence_skill),
     "region-statistics": Case(REGION_STATISTICS, (PARTIAL,), region_statistics),
     "reprojection": Case(REPROJECTION),
-    "regridding": Case(REGRIDDING, None, regridding, weights=True),
+    "regridding": Case(REGRIDDING, (FINAL,), regridding, weights=True),
 }
 CHECKED = [name for name, case in CASES.items() if case.reference]
 UNCHECKED = [name for name, case in CASES.items() if not case.reference]
@@ -395,11 +395,6 @@ SHOULD = {
     "persistence-skill": (
         (PARTIAL,),
         "two-scan fragments, with the truth's chunks derived from the join predicate",
-    ),
-    "regridding": (
-        (FINAL,),
-        "a broadcast join of a small table, then the final aggregate on the workers, "
-        "as each group's time is in one chunk",
     ),
     "reprojection": ((MAP,), "UDFs in the worker, and map-only fragments"),
 }

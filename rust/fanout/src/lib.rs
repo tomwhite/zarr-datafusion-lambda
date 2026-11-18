@@ -21,6 +21,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{extensions_options, JoinType};
 use datafusion::config::{ConfigExtension, ConfigOptions};
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
@@ -173,12 +174,15 @@ pub fn session(fan_out: Arc<FanOut>, target_partitions: Option<usize>) -> Sessio
             .with_physical_optimizer_rule(Arc::new(split::PerValueRule)),
         target_partitions,
     );
-    ctx.state_ref()
-        .write()
-        .config_mut()
-        .options_mut()
-        .extensions
-        .insert(LambdaOptions::default());
+    let state = ctx.state_ref();
+    let mut state = state.write();
+    let options = state.config_mut().options_mut();
+    options.extensions.insert(LambdaOptions::default());
+    // Collect a hash join's build side whenever a worker could hold it, so that
+    // the cut can broadcast it: its own cap on the build side's files decides.
+    options.optimizer.hash_join_single_partition_threshold = 1024 * 1024 * 1024;
+    options.optimizer.hash_join_single_partition_threshold_rows = usize::MAX;
+    drop(state);
     ctx
 }
 
@@ -563,7 +567,8 @@ fn scan_left_here(
                     .to_string()
             } else {
                 "a Zarr scan is joined with a side that can't be sent to every worker: that \
-                 needs an inner join, and rows held in memory, at most 1 MB, on its build side"
+                 needs an inner join, and on its build side rows held in memory, at most \
+                 1 MB, or files, at most 64 MB"
                     .to_string()
             };
         }
@@ -595,14 +600,19 @@ fn contains_fan_out(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.is::<MapLambdaZarrExec>() || plan.children().into_iter().any(contains_fan_out)
 }
 
-/// The most a broadcast build side may hold, which travels in the fragment, in
-/// every dispatcher's request, under Lambda's 6 MB request limit.
+/// The most a broadcast build side may hold in memory, which travels in the
+/// fragment, in every dispatcher's request, under Lambda's 6 MB request limit.
 const BROADCAST_BYTES: usize = 1024 * 1024;
 
-/// The probe side of an inner join whose build side is rows held in this
-/// process, few enough to broadcast. An inner join matches each probe row
-/// against the whole build side alone, so it works row by row on the probe
-/// side; an outer join would repeat its unmatched build rows on every worker.
+/// The most a broadcast build side may read from files, which every worker reads
+/// whole and holds while it joins its chunks.
+// TODO: measure against a worker's memory.
+const BROADCAST_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The probe side of an inner join whose build side every worker can be sent
+/// whole. An inner join matches each probe row against the whole build side
+/// alone, so it works row by row on the probe side; an outer join would repeat
+/// its unmatched build rows on every worker.
 fn broadcast_probe(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
     let (join_type, build, probe) = if let Some(join) = node.downcast_ref::<NestedLoopJoinExec>() {
         (join.join_type(), join.left(), join.right())
@@ -612,22 +622,42 @@ fn broadcast_probe(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPl
             .filter(|j| *j.partition_mode() == PartitionMode::CollectLeft)?;
         (join.join_type(), join.left(), join.right())
     };
-    (*join_type == JoinType::Inner && in_memory_bytes(build)? <= BROADCAST_BYTES).then_some(probe)
+    (*join_type == JoinType::Inner && broadcastable(build)).then_some(probe)
 }
 
-/// The bytes of rows `plan` holds in memory, if that's all it reads, through
-/// nodes that pass them on.
-fn in_memory_bytes(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+/// Whether `build` reads only rows held here, few enough to travel in the
+/// fragment, or files, few enough for every worker to read whole itself.
+fn broadcastable(build: &Arc<dyn ExecutionPlan>) -> bool {
+    let Some(source) = source_under(build) else {
+        return false;
+    };
+    let data = source.data_source();
+    if let Some(memory) = data.downcast_ref::<MemorySourceConfig>() {
+        let bytes: usize = memory
+            .partitions()
+            .iter()
+            .flatten()
+            .map(RecordBatch::get_array_memory_size)
+            .sum();
+        return bytes <= BROADCAST_BYTES;
+    }
+    data.downcast_ref::<FileScanConfig>().is_some_and(|files| {
+        // a file split into ranges is in several groups, each with its whole size
+        let sizes: HashMap<_, _> = files
+            .file_groups
+            .iter()
+            .flat_map(|group| group.iter())
+            .map(|file| (&file.object_meta.location, file.object_meta.size))
+            .collect();
+        sizes.values().sum::<u64>() <= BROADCAST_FILE_BYTES
+    })
+}
+
+/// The source `plan` reads, if it reads only one, through nodes that pass its
+/// rows on.
+fn source_under(plan: &Arc<dyn ExecutionPlan>) -> Option<&DataSourceExec> {
     if let Some(source) = plan.downcast_ref::<DataSourceExec>() {
-        let memory = source.data_source().downcast_ref::<MemorySourceConfig>()?;
-        return Some(
-            memory
-                .partitions()
-                .iter()
-                .flatten()
-                .map(RecordBatch::get_array_memory_size)
-                .sum(),
-        );
+        return Some(source);
     }
     let passes_on = plan.is::<ProjectionExec>()
         || plan.is::<FilterExec>()
@@ -638,10 +668,25 @@ fn in_memory_bytes(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
         return None;
     };
     if passes_on {
-        in_memory_bytes(child)
+        source_under(child)
     } else {
         None
     }
+}
+
+/// The object stores of the files `plan` reads, as URLs such as `s3://bucket/`.
+fn file_stores(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
+    let mut stores = vec![];
+    let _ = plan.apply(|node| {
+        if let Some(files) = node
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|source| source.data_source().downcast_ref::<FileScanConfig>())
+        {
+            stores.push(files.object_store_url.as_str().to_string());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    stores
 }
 
 /// The scan's partitions cut into single chunks, less any that read nothing.
@@ -1203,10 +1248,19 @@ impl ExecutionPlan for MapLambdaZarrExec {
         let locations = if settings.endpoint_url.is_some() {
             vec![]
         } else {
+            let files = file_stores(&self.plan);
+            if files.iter().any(|store| store.starts_with("file:")) {
+                return Err(DataFusionError::Plan(
+                    "a join's build side reads local files, which the workers can't: put \
+                     them in S3"
+                        .to_string(),
+                ));
+            }
             split::zarr_scans(&self.plan)?
                 .iter()
                 .filter_map(|scan| scan.downcast_ref::<ZarrExec>())
                 .map(|scan| scan.path().to_string())
+                .chain(files)
                 .collect()
         };
         let (fan_out, template) = (self.fan_out.clone(), self.template());
