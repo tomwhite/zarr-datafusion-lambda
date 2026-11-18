@@ -12,6 +12,7 @@ from tests.stores import (
     DISABLED,
     LOCAL,
     PENCILS,
+    REGIONS_SQL,
     SHAPE,
     TIME_START,
     VARIABLE,
@@ -461,6 +462,47 @@ def test_a_query_whose_aggregate_doesnt_work_chunk_by_chunk_doesnt_fan_out(
     era5_metadata, query, why
 ):
     assert fragments({"era5": era5_metadata}, query) == [], why
+
+
+REGIONS = REGIONS_SQL.replace("AS regions(", "AS r(")
+IN_REGION = "a.latitude BETWEEN r.south AND r.north AND a.longitude BETWEEN r.west AND r.east"
+
+
+def by_region(joined):
+    return f"SELECT r.region, avg(a.t2m) AS mean, count(*) AS n FROM {joined} GROUP BY r.region"
+
+
+def test_a_join_with_a_small_table_fans_out_with_the_table_in_the_fragment(era5_metadata):
+    s = session({"era5": era5_metadata}, **LOCAL)
+    query = by_region(f"{REGIONS} JOIN era5 a ON {IN_REGION}")
+
+    assert len(s.fragments(query)) == 1
+    [fragment] = s.explain_fragments(query)
+    assert "NestedLoopJoinExec" in fragment
+    assert "DataSourceExec: partitions=1" in fragment
+
+
+@pytest.mark.parametrize(
+    ("joined", "why"),
+    [
+        (f"era5 a JOIN {REGIONS} ON {IN_REGION}", "the scan written first is the build side"),
+        (
+            f"{REGIONS} LEFT JOIN era5 a ON {IN_REGION}",
+            "every worker would add the regions none of its rows fall in",
+        ),
+        (f"big r JOIN era5 a ON {IN_REGION}", "the table is too big to send every worker"),
+    ],
+)
+def test_a_join_that_cant_be_broadcast_doesnt_fan_out(era5_metadata, joined, why):
+    s = session({"era5": era5_metadata}, **LOCAL)
+    # 1.6 MB as two float64 columns
+    s.sql(
+        "CREATE TABLE big AS SELECT CAST(value AS DOUBLE) AS south, "
+        "CAST(value AS DOUBLE) + 90 AS north, 0.0 AS west, 360.0 AS east, "
+        "CAST(value AS VARCHAR) AS region FROM generate_series(1, 100000)"
+    )
+
+    assert s.fragments(by_region(joined)) == [], why
 
 
 # TODO: CAST(time AS TIMESTAMP) because zarr-datafusion's time is UTC, and the
