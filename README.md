@@ -6,8 +6,7 @@ How fast can we query ERA5 Zarr data using SQL and the [map-lambda](https://gith
 1940 to 2025 (3.1 TB uncompressed), written to Zarr on S3, takes ~136s and
 costs ~$3.07**
 
-Each benchmark has a page with its query, how it runs, and how its results
-were checked:
+Each benchmark has a page explaining how it was run.
 
 | Benchmark | Shape | Window | Time | Cost | Checked against |
 |---|---|---|---|---|---|
@@ -16,6 +15,7 @@ were checked:
 | [Region statistics](docs/benchmarks/region-statistics.md) | joined with a small table | 1940–2024 | 102s | $2.49 | xarray |
 | [Hourly climatology](docs/benchmarks/climatology.md) | finished and written to Zarr by the workers | 1940–2025 | 136s | $3.07 | xarray |
 | [Regridding](docs/benchmarks/regridding.md) | joined with weights from S3, finished and written to Zarr by the workers | 2015–2024 | 66s | $0.87 | xarray |
+| [Wind speed](docs/benchmarks/wind-speed.md) | no aggregate, written to Zarr by the workers | 2015–2024 | 58s | $0.78 | xarray |
 
 ## How it works
 
@@ -44,6 +44,10 @@ For [regridding](docs/benchmarks/regridding.md), the weights are a table in
 S3, which each worker reads whole and joins its own chunks with. As for the
 climatology, each worker has all of a group's rows, an hour's, so it finishes
 the aggregate and writes the output itself.
+
+For the [wind speed](docs/benchmarks/wind-speed.md), there is no aggregate:
+each worker computes its own chunks' rows and writes them to the output, so
+only a count comes back.
 
 This project is set up for running benchmarks, it is not a general purpose SQL engine.
 

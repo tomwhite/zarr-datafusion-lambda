@@ -282,7 +282,7 @@ impl PhysicalOptimizerRule for FanOutRule {
                     Some(exec) => Some(exec),
                     None => match finish(&node)? {
                         Some(exec) => Some(exec),
-                        None => write(&node)?,
+                        None => write(&node, &self.0)?,
                     },
                 };
                 Ok(match exec {
@@ -384,9 +384,13 @@ fn finish(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>
     Ok(Some(Arc::new(finished)))
 }
 
-/// A Zarr sink over a fan-out of finished rows, moved onto the workers, each
-/// writing the chunks its tiles fall in.
-fn write(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+/// A Zarr sink over a fan-out of finished rows, or over a Zarr scan's rows
+/// with no aggregate, moved onto the workers, each writing the chunks its
+/// tiles fall in.
+fn write(
+    node: &Arc<dyn ExecutionPlan>,
+    lambdas: &Arc<FanOut>,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let Some(sink) = node.downcast_ref::<DataSinkExec>() else {
         return Ok(None);
     };
@@ -404,14 +408,22 @@ fn write(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>
         }
         input = input.children()[0];
     }
-    let Some(fan_out) = input
-        .downcast_ref::<MapLambdaZarrExec>()
-        .filter(|f| f.finished)
-    else {
-        return Ok(None);
-    };
     let Some(zarr) = sink.sink().downcast_ref::<ZarrDataSink>() else {
         return Ok(None);
+    };
+    let rows;
+    let fan_out = match (
+        input.downcast_ref::<MapLambdaZarrExec>(),
+        input.downcast_ref::<ZarrExec>().and_then(chunks),
+    ) {
+        (Some(fan_out), _) if fan_out.finished => fan_out,
+        (None, Some(chunks)) => {
+            let per_invocation = lambdas.settings.chunks_per_invocation.max(1);
+            let runs = chunks.chunks(per_invocation).map(<[_]>::to_vec).collect();
+            rows = MapLambdaZarrExec::new(input.clone(), runs, true, lambdas.clone())?;
+            &rows
+        }
+        _ => return Ok(None),
     };
     let runs = if fan_out.tiles_chunks(zarr.spec()) {
         fan_out.runs.clone()
@@ -593,9 +605,19 @@ fn scan_left_here(
         }
     }
     if !above.iter().any(|n| n.is::<AggregateExec>()) {
-        return "a Zarr scan has no aggregate above it to cut at, and map-only fragments \
-                aren't built"
-            .to_string();
+        let written = above.iter().any(|n| {
+            n.downcast_ref::<DataSinkExec>()
+                .is_some_and(|sink| sink.sink().downcast_ref::<ZarrDataSink>().is_some())
+        });
+        return if written {
+            "the Zarr output's chunks don't each lie in one invocation's share of the \
+             source, so two workers would write one"
+                .to_string()
+        } else {
+            "a Zarr scan has no aggregate above it, so every row it reads would come back \
+             here: COPY them to Zarr, which the workers write"
+                .to_string()
+        };
     }
     let blocking: Vec<_> = above
         .iter()

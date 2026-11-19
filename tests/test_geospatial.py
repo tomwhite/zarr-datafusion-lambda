@@ -388,7 +388,7 @@ def test_a_case_that_cant_be_cut_is_refused(tmp_path, name):
 
 # How each case should be cut, and what that needs.
 SHOULD = {
-    "derived-variable": ((MAP,), "map-only fragments"),
+    "derived-variable": ((MAP,), "map-only fragments returning rows, not writing them"),
     "anomaly": (
         (MAP, PARTIAL),
         "a sliced broadcast: the climatology's slice joined with each probe fragment's chunks",
@@ -441,3 +441,39 @@ def test_regridding_written_to_zarr_on_the_workers_matches_xarray(tmp_path):
     ]
     key = itemgetter("time", "lat", "lon")
     rows_close(sorted(rows, key=key), reference(tmp_path, case))
+
+
+# The derived variable over ten days, written in the source's chunks
+DERIVED_VARIABLE_COPY = """
+COPY (
+    SELECT time, latitude, longitude, sqrt(u10 * u10 + v10 * v10) AS wind_speed
+    FROM era5
+    WHERE time < TIMESTAMP '1979-01-11 00:00:00'
+) TO '{output}' STORED AS ZARR OPTIONS ('chunks' '31,19,36')
+"""
+
+
+def test_a_derived_variable_copied_to_zarr_is_written_by_the_workers(tmp_path):
+    s = connect(tmp_path, CASES["derived-variable"], with_values=False)
+
+    [fragment] = s.explain_fragments(DERIVED_VARIABLE_COPY.format(output=tmp_path / "out.zarr"))
+
+    assert kind(fragment) == MAP
+    assert "DataSinkExec" in fragment
+
+
+@pytest.mark.lambda_integration
+def test_a_derived_variable_written_to_zarr_on_the_workers_matches_xarray(tmp_path):
+    output = tmp_path / "wind_speed.zarr"
+
+    _, reports = connect(tmp_path, CASES["derived-variable"]).sql(
+        DERIVED_VARIABLE_COPY.format(output=output)
+    )
+
+    [report] = json.loads(reports)
+    assert report["invocations"] > 1
+    ds = xr.open_zarr(tmp_path / "era5", consolidated=False).sel(time=slice(None, "1979-01-10"))
+    # in float32, as the query computes it
+    expected = np.sqrt(ds.u10 * ds.u10 + ds.v10 * ds.v10)
+    written = xr.open_zarr(output, consolidated=False).wind_speed
+    xr.testing.assert_allclose(written, expected.rename("wind_speed"), rtol=1e-6)
