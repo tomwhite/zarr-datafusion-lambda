@@ -5409,6 +5409,7 @@ dependencies = [
  "tokio",
  "url",
  "zarr-datafusion",
+ "zarrs",
  "zarrs_object_store",
  "zarrs_storage",
 ]
@@ -6409,7 +6410,7 @@ dependencies = [
 [[package]]
 name = "zarr-datafusion"
 version = "0.1.1"
-source = "git+https://github.com/tomwhite/zarr-datafusion?rev=38402df#38402df89fd7e5fb76aeed09496980a2321d79d1"
+source = "git+https://github.com/tomwhite/zarr-datafusion?rev=33fc6ca#33fc6caaad0435dcb8055ed03514e9cc5bc6d72a"
 dependencies = [
  "arrow",
  "async-trait",

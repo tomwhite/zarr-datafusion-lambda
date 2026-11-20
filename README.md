@@ -6,7 +6,11 @@ How fast can we query ERA5 Zarr data using SQL and the [map-lambda](https://gith
 1940 to 2025 (3.1 TB uncompressed), written to Zarr on S3, takes ~136s and
 costs ~$3.07**
 
-Each benchmark has a page explaining how it was run.
+Each benchmark has a page explaining how it was run. This table is a summary.
+Note that some of the benchmarks have not been run on the whole ERA5 dataset,
+and have been run by restricting the time window to 5 or 10 years. It is
+expected that they will scale to the whole dataset with a proportional increase
+in time and cost.
 
 | Benchmark | Shape | Window | Time | Cost | Checked against |
 |---|---|---|---|---|---|
@@ -16,6 +20,7 @@ Each benchmark has a page explaining how it was run.
 | [Hourly climatology](docs/benchmarks/climatology.md) | finished and written to Zarr by the workers | 1940–2025 | 136s | $3.07 | xarray |
 | [Regridding](docs/benchmarks/regridding.md) | joined with weights from S3, finished and written to Zarr by the workers | 2015–2024 | 66s | $0.87 | xarray |
 | [Wind speed](docs/benchmarks/wind-speed.md) | no aggregate, written to Zarr by the workers | 2015–2024 | 58s | $0.78 | xarray |
+| [Anomaly](docs/benchmarks/anomaly.md) | joined with its climatology, written to Zarr first, and written to Zarr by the workers | 2019–2024 | 152s | $1.26 | xarray |
 
 ## How it works
 
@@ -48,6 +53,11 @@ the aggregate and writes the output itself.
 For the [wind speed](docs/benchmarks/wind-speed.md), there is no aggregate:
 each worker computes its own chunks' rows and writes them to the output, so
 only a count comes back.
+
+For the [anomaly](docs/benchmarks/anomaly.md), the climatology is written to
+Zarr first, and the query is joined with that store: each worker reads a
+pencil of ERA5 and the climatology's chunk over the same cells, and writes the
+pencil's chunk of the output itself.
 
 This project is set up for running benchmarks, it is not a general purpose SQL engine.
 

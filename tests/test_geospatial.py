@@ -477,3 +477,185 @@ def test_a_derived_variable_written_to_zarr_on_the_workers_matches_xarray(tmp_pa
     expected = np.sqrt(ds.u10 * ds.u10 + ds.v10 * ds.v10)
     written = xr.open_zarr(output, consolidated=False).wind_speed
     xr.testing.assert_allclose(written, expected.rename("wind_speed"), rtol=1e-6)
+
+
+# The anomaly as two statements: its climatology CTE written to Zarr first,
+# then the query joined with that store, summarised by latitude, as its rows
+# would be too many to return.
+def anomaly_window(table, box=True):
+    window = (
+        f"{table}time >= TIMESTAMP '1979-01-15 03:00:00' "
+        f"AND {table}time < TIMESTAMP '1979-03-01 00:00:00'"
+    )
+    if box:
+        window += f" AND {table}latitude BETWEEN 25 AND 50 AND {table}longitude BETWEEN 235 AND 290"
+    return window
+
+
+STORED_CLIMATOLOGY = """
+COPY (
+    SELECT latitude, longitude, date_part('hour', CAST(time AS TIMESTAMP)) AS hour,
+           avg(t2m) AS clim_t
+    FROM era5
+    WHERE {window}
+    GROUP BY 1, 2, 3
+) TO '{output}' STORED AS ZARR OPTIONS ('chunks' '24,{chunks}')
+"""
+
+# the stored climatology first, as the smaller side is built from
+ANOMALY_BY_LATITUDE = f"""
+SELECT a.latitude,
+       sum(power(a.t2m - c.clim_t, 2)) AS squares,
+       min(a.t2m - c.clim_t)           AS low,
+       max(a.t2m - c.clim_t)           AS high,
+       count(*)                        AS n
+FROM clim c
+JOIN era5 a
+  ON a.latitude = c.latitude
+ AND a.longitude = c.longitude
+ AND date_part('hour', CAST(a.time AS TIMESTAMP)) = c.hour
+WHERE {anomaly_window("a.")}
+GROUP BY 1
+ORDER BY 1 DESC
+"""
+
+
+def anomaly_by_latitude(ds):
+    t2m = ds.t2m.sel(
+        time=slice("1979-01-15T03", "1979-02-28T23"),
+        latitude=slice(50, 25),
+        longitude=slice(235, 290),
+    ).astype("float64")
+    by_hour = t2m.groupby("time.hour")
+    anomaly = by_hour - by_hour.mean()
+    cells = ["time", "longitude"]
+    stats = {
+        "squares": (anomaly**2).sum(cells),
+        "low": anomaly.min(cells),
+        "high": anomaly.max(cells),
+        "n": anomaly.count(cells),
+    }
+    return [
+        {"latitude": float(lat), **{k: v.item(i) for k, v in stats.items()}}
+        for i, lat in enumerate(anomaly.latitude.values)
+    ]
+
+
+def stored_climatology(tmp_path, chunks, box=True):
+    """A session over a store chunked as `chunks`, and its climatology, written to Zarr."""
+    era5 = tmp_path / "era5"
+    write_group(era5, chunks=chunks)
+    clim = tmp_path / "clim.zarr"
+    query = STORED_CLIMATOLOGY.format(
+        window=anomaly_window("", box), output=clim, chunks=f"{chunks[1]},{chunks[2]}"
+    )
+    session({"era5": era5.as_uri()}, **LOCAL, config=DISABLED).sql(query)
+    tables = {"era5": era5.as_uri(), "clim": clim.as_uri()}
+    # the window is a few chunks, so a few an invocation to deal it out
+    return session(tables, **LOCAL, chunks_per_invocation=2)
+
+
+def test_a_join_with_a_stored_climatology_reads_both_stores_in_one_fragment(tmp_path):
+    s = stored_climatology(tmp_path, PENCILS)
+
+    [fragment] = s.explain_fragments(ANOMALY_BY_LATITUDE)
+
+    assert kind(fragment) == PARTIAL
+    assert "HashJoinExec: mode=CollectLeft" in fragment
+    assert fragment.count("ZarrExec") == 2
+
+
+@pytest.mark.lambda_integration
+@pytest.mark.parametrize("chunks", [PENCILS, CHUNKS], ids=["pencils", "pancakes"])
+def test_a_join_with_a_stored_climatology_matches_xarray(tmp_path, chunks):
+    s = stored_climatology(tmp_path, chunks)
+
+    stream, reports = s.sql(ANOMALY_BY_LATITUDE)
+
+    [report] = json.loads(reports)
+    assert report["invocations"] > 1
+    rows = pa.ipc.open_stream(stream).read_all().to_pylist()
+    rows_close(rows, anomaly_by_latitude(xr.open_zarr(tmp_path / "era5", consolidated=False)))
+
+
+# Over the whole globe, as the output of a write split by tile must cover each
+# axis it is split on
+ANOMALY_COPY = f"""
+COPY (
+    SELECT a.time, a.latitude, a.longitude, a.t2m - c.clim_t AS anomaly
+    FROM clim c
+    JOIN era5 a
+      ON a.latitude = c.latitude
+     AND a.longitude = c.longitude
+     AND date_part('hour', CAST(a.time AS TIMESTAMP)) = c.hour
+    WHERE {anomaly_window("a.", box=False)}
+) TO '{{output}}' STORED AS ZARR OPTIONS ('chunks' '{{chunks}}')
+"""
+
+
+def test_an_anomaly_copied_to_zarr_is_written_by_the_workers_joining_both_stores(tmp_path):
+    s = stored_climatology(tmp_path, PENCILS, box=False)
+    query = ANOMALY_COPY.format(output=tmp_path / "anomaly.zarr", chunks="310,5,6")
+
+    [fragment] = s.explain_fragments(query)
+
+    assert kind(fragment) == MAP
+    assert "DataSinkExec" in fragment
+    assert fragment.count("ZarrExec") == 2
+
+
+@pytest.mark.lambda_integration
+@pytest.mark.parametrize(
+    ("chunks", "output_chunks"),
+    [(PENCILS, "310,5,6"), (CHUNKS, "31,19,36")],
+    ids=["pencils", "pancakes"],
+)
+def test_an_anomaly_written_to_zarr_on_the_workers_matches_xarray(tmp_path, chunks, output_chunks):
+    s = stored_climatology(tmp_path, chunks, box=False)
+    output = tmp_path / "anomaly.zarr"
+
+    _, reports = s.sql(ANOMALY_COPY.format(output=output, chunks=output_chunks))
+
+    [report] = json.loads(reports)
+    assert report["invocations"] > 1
+    ds = xr.open_zarr(tmp_path / "era5", consolidated=False)
+    t2m = ds.t2m.sel(time=slice("1979-01-15T03", "1979-02-28T23")).astype("float64")
+    by_hour = t2m.groupby("time.hour")
+    expected = (by_hour - by_hour.mean()).drop_vars("hour").rename("anomaly")
+    written = xr.open_zarr(output, consolidated=False).anomaly
+    xr.testing.assert_allclose(written, expected, rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.lambda_integration
+@pytest.mark.parametrize(
+    ("start", "end", "per_invocation", "invocations"),
+    [
+        # a tile's window spans pencils, which two at a time span invocations
+        ("1979-01-15T03", "1979-03-01T00", 2, None),
+        # two pencils, from the 310th hour: a pencil, so an output chunk, an invocation
+        ("1979-01-13T22", "1979-02-08T18", 1, 4 * 6 * 2),
+    ],
+    ids=["unaligned", "aligned"],
+)
+def test_a_write_over_pencils_split_through_time_matches_xarray(
+    tmp_path, start, end, per_invocation, invocations
+):
+    era5 = tmp_path / "era5"
+    write_group(era5, chunks=PENCILS, variables=SURFACE)
+    s = session({"era5": era5.as_uri()}, **LOCAL, chunks_per_invocation=per_invocation)
+    output = tmp_path / "wind_speed.zarr"
+    window = f"time >= TIMESTAMP '{start}:00:00' AND time < TIMESTAMP '{end}:00:00'"
+    query = DERIVED_VARIABLE_COPY.replace(
+        "WHERE time < TIMESTAMP '1979-01-11 00:00:00'", f"WHERE {window}"
+    ).format(output=output)
+
+    _, reports = s.sql(query.replace("'31,19,36'", "'310,5,6'"))
+
+    [report] = json.loads(reports)
+    if invocations:
+        assert report["invocations"] == invocations
+    last = np.datetime64(end) - np.timedelta64(1, "h")
+    ds = xr.open_zarr(era5, consolidated=False).sel(time=slice(start, last))
+    expected = np.sqrt(ds.u10 * ds.u10 + ds.v10 * ds.v10).rename("wind_speed")
+    written = xr.open_zarr(output, consolidated=False).wind_speed
+    xr.testing.assert_allclose(written, expected, rtol=1e-6)

@@ -101,13 +101,65 @@ pub fn zarr_scans(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<Arc<dyn Execution
     Ok(scans)
 }
 
-/// Why `plan` can't be bound to some chunks, if it can't. Every scan in it would
-/// be bound to the same partitions, which is only right for a single scan.
-fn single_scan_problem(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<&'static str>> {
-    Ok(match zarr_scans(plan)?.len() {
-        0 => Some("it reads no Zarr chunks"),
-        1 => None,
-        _ => Some("it scans Zarr tables more than once, which needs a join across chunks"),
+/// A coordinate of `scan`'s store, read whole, raw: a time is in its stored
+/// units, not decoded.
+pub async fn coordinate_values(scan: &ZarrExec, name: &str) -> Result<Vec<f64>> {
+    let coord = scan
+        .store_meta()
+        .and_then(|meta| meta.coords.iter().find(|c| c.name == name))
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!("{} has no coordinate {name}", scan.path()))
+        })?;
+    let (store, prefix) = scan.open_store().await?;
+    let path = if prefix.as_ref().is_empty() {
+        format!("/{name}")
+    } else {
+        format!("/{prefix}/{name}")
+    };
+    let external = |e: Box<dyn std::error::Error + Send + Sync>| DataFusionError::External(e);
+    let array = zarrs::array::Array::async_open(store, &path)
+        .await
+        .map_err(|e| external(e.into()))?;
+    let all = array.subset_all();
+    macro_rules! read {
+        ($t:ty) => {
+            array
+                .async_retrieve_array_subset::<Vec<$t>>(&all)
+                .await
+                .map_err(|e| external(e.into()))?
+                .into_iter()
+                .map(|v| v as f64)
+                .collect()
+        };
+    }
+    Ok(match coord.data_type.as_str() {
+        "float32" => read!(f32),
+        "float64" => read!(f64),
+        "int8" => read!(i8),
+        "int16" => read!(i16),
+        "int32" => read!(i32),
+        "uint8" => read!(u8),
+        "uint16" => read!(u16),
+        "uint32" => read!(u32),
+        "uint64" => read!(u64),
+        _ => read!(i64),
+    })
+}
+
+/// Why `plan` can't be bound to `lists` of chunks, if it can't: one list is
+/// for a single scan, else there is a list for each scan, in [`zarr_scans`]'s
+/// order.
+fn binding_problem(plan: &Arc<dyn ExecutionPlan>, lists: usize) -> Result<Option<String>> {
+    Ok(match (zarr_scans(plan)?.len(), lists) {
+        (0, _) => Some("it reads no Zarr chunks".to_string()),
+        (1, 1) => None,
+        (scans, 1) => Some(format!(
+            "it scans Zarr tables {scans} times, and was sent one list of chunks"
+        )),
+        (scans, lists) if scans != lists => Some(format!(
+            "it scans Zarr tables {scans} times, and was sent {lists} lists of chunks"
+        )),
+        _ => None,
     })
 }
 
@@ -151,15 +203,16 @@ async fn icechunk_store(path: &str, anonymous: bool) -> Result<AsyncReadableList
     .map_err(DataFusionError::External)
 }
 
-/// `plan` with each Zarr scan reading `partitions` instead of its own, through
-/// a cached store when its location is remote. Also returns the scans, whose
-/// I/O counters fill in once the plan runs.
+/// `plan` with each Zarr scan reading its list of `partitions`, with its
+/// `budgets`, instead of its own, through a cached store when its location is
+/// remote. Also returns the scans, whose I/O counters fill in once the plan
+/// runs.
 async fn bind(
     plan: Arc<dyn ExecutionPlan>,
-    partitions: &[PartitionSpec],
-    budget: Option<u64>,
+    partitions: &[Vec<PartitionSpec>],
+    budgets: &[Option<u64>],
 ) -> Result<(Arc<dyn ExecutionPlan>, Vec<Arc<ZarrExec>>)> {
-    if let Some(problem) = single_scan_problem(&plan)? {
+    if let Some(problem) = binding_problem(&plan, partitions.len())? {
         return Err(DataFusionError::Plan(format!(
             "can't run this fragment: {problem}"
         )));
@@ -182,6 +235,13 @@ async fn bind(
             let Some(scan) = node.downcast_ref::<ZarrExec>() else {
                 return Ok(Transformed::no(node));
             };
+            // in `zarr_scans`'s order, as both visit parents before children
+            let i = if partitions.len() == 1 {
+                0
+            } else {
+                scans.len()
+            };
+            let (partitions, budget) = (&partitions[i], budgets[i]);
             let cached = caches[scan.path()].clone();
             let meta = cached.as_ref().map(|(_, _, meta)| meta.clone());
             let bound = Arc::new(
@@ -300,11 +360,12 @@ pub struct Run {
 /// full-globe chunk no longer fit its share of the budget.
 pub const DEFAULT_IN_FLIGHT: usize = 2;
 
-/// Run a fragment over `partitions` of its scan, one per chunk, as a worker
-/// does, `in_flight` of them at once, or [`DEFAULT_IN_FLIGHT`].
+/// Run a fragment over `partitions` of its scans, one per chunk, as a worker
+/// does, `in_flight` of them at once, or [`DEFAULT_IN_FLIGHT`]: one list for a
+/// fragment of one scan, else a list for each scan in [`zarr_scans`]'s order.
 pub async fn run_fragment(
     plan: &str,
-    partitions: &[PartitionSpec],
+    partitions: &[Vec<PartitionSpec>],
     in_flight: Option<usize>,
 ) -> Result<Run> {
     let in_flight = in_flight.unwrap_or(DEFAULT_IN_FLIGHT).max(1);
@@ -320,9 +381,14 @@ pub async fn run_fragment(
     let plan = decode_plan(&ctx, plan)?;
     timings.decode = elapsed_ms();
     // zarr-datafusion divides a scan's budget among all its partitions
-    let running = in_flight.min(partitions.len()).max(1) as u64;
-    let budget = scan_budget().map(|b| b * partitions.len().max(1) as u64 / running);
-    let (plan, scans) = bind(plan, partitions, budget).await?;
+    let budgets: Vec<_> = partitions
+        .iter()
+        .map(|partitions| {
+            let running = in_flight.min(partitions.len()).max(1) as u64;
+            scan_budget().map(|b| b * partitions.len().max(1) as u64 / running)
+        })
+        .collect();
+    let (plan, scans) = bind(plan, partitions, &budgets).await?;
     let plan = merge_partials(per_value::rewrite_plan(plan)?, in_flight)?;
     timings.bind = elapsed_ms();
     let batches = collect(plan.clone(), ctx.task_ctx()).await?;

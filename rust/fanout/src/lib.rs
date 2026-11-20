@@ -10,12 +10,13 @@ pub mod region;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use datafusion::arrow::array::{AsArray, UInt64Array};
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::datatypes::UInt64Type;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{extensions_options, JoinType};
@@ -282,7 +283,7 @@ impl PhysicalOptimizerRule for FanOutRule {
                     Some(exec) => Some(exec),
                     None => match finish(&node)? {
                         Some(exec) => Some(exec),
-                        None => write(&node, &self.0)?,
+                        None => write(&node, &self.0, broadcast_bytes)?,
                     },
                 };
                 Ok(match exec {
@@ -323,9 +324,10 @@ impl FanOutRule {
         else {
             return Ok(None);
         };
-        let Some(scan) = chunkwise_scan(node, broadcast_bytes) else {
+        let Some(probe) = chunkwise_scan(node, broadcast_bytes) else {
             return Ok(None);
         };
+        let scan = probe.downcast_ref::<ZarrExec>().expect("a Zarr scan");
         let Some(chunks) = chunks(scan) else {
             return Ok(None);
         };
@@ -337,11 +339,12 @@ impl FanOutRule {
             (runs, groups_within_chunks(partial, scan, &chunks))
         };
         let mut exec = MapLambdaZarrExec::new(
-            without_round_robin(node.clone())?,
+            collect_left(without_round_robin(node.clone())?)?,
             runs,
             whole_groups,
             self.0.clone(),
         )?;
+        exec.joined = joined_scans(node, probe, broadcast_bytes);
         if combine {
             exec.reduce = split::encode_reduce(&exec.plan)?;
         }
@@ -381,6 +384,7 @@ fn finish(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>
     let mut finished =
         MapLambdaZarrExec::new(plan, fan_out.runs.clone(), false, fan_out.fan_out.clone())?;
     finished.finished = true;
+    finished.joined = fan_out.joined.clone();
     Ok(Some(Arc::new(finished)))
 }
 
@@ -390,6 +394,7 @@ fn finish(node: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>
 fn write(
     node: &Arc<dyn ExecutionPlan>,
     lambdas: &Arc<FanOut>,
+    broadcast_bytes: usize,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let Some(sink) = node.downcast_ref::<DataSinkExec>() else {
         return Ok(None);
@@ -403,6 +408,10 @@ fn write(
             || input.is::<RepartitionExec>()
             || input.is::<CoalescePartitionsExec>()
             || input.is::<CooperativeExec>();
+        if let Some(probe) = broadcast_probe(input, broadcast_bytes) {
+            input = probe;
+            continue;
+        }
         if !rowwise {
             break;
         }
@@ -420,7 +429,10 @@ fn write(
         (None, Some(chunks)) => {
             let per_invocation = lambdas.settings.chunks_per_invocation.max(1);
             let runs = chunks.chunks(per_invocation).map(<[_]>::to_vec).collect();
-            rows = MapLambdaZarrExec::new(input.clone(), runs, true, lambdas.clone())?;
+            rows = MapLambdaZarrExec {
+                joined: joined_scans(node, input, broadcast_bytes),
+                ..MapLambdaZarrExec::new(sink.input().clone(), runs, true, lambdas.clone())?
+            };
             &rows
         }
         _ => return Ok(None),
@@ -437,16 +449,17 @@ fn write(
         }
     };
     let fragment = Arc::new(DataSinkExec::new(
-        inline(sink.input().clone(), &fan_out.plan)?,
+        collect_left(without_round_robin(inline(
+            sink.input().clone(),
+            &fan_out.plan,
+        )?)?)?,
         Arc::new(zarr.clone().writing_chunks()),
         sink.sort_order().clone(),
     ));
-    Ok(Some(Arc::new(MapLambdaZarrExec::new(
-        fragment,
-        runs,
-        false,
-        fan_out.fan_out.clone(),
-    )?)))
+    Ok(Some(Arc::new(MapLambdaZarrExec {
+        joined: fan_out.joined.clone(),
+        ..MapLambdaZarrExec::new(fragment, runs, false, fan_out.fan_out.clone())?
+    })))
 }
 
 /// `plan` with the fan-out in it replaced by the fragment it runs.
@@ -486,11 +499,14 @@ fn without_round_robin(fragment: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn Execu
 /// row by row, so that a worker given some chunks computes exactly their share
 /// of the partial states. A join counts when every worker can be sent its
 /// build side whole.
-fn chunkwise_scan(partial: &Arc<dyn ExecutionPlan>, broadcast_bytes: usize) -> Option<&ZarrExec> {
+fn chunkwise_scan(
+    partial: &Arc<dyn ExecutionPlan>,
+    broadcast_bytes: usize,
+) -> Option<&Arc<dyn ExecutionPlan>> {
     let mut node = *partial.children().first()?;
     loop {
-        if let Some(scan) = node.downcast_ref::<ZarrExec>() {
-            return Some(scan);
+        if node.is::<ZarrExec>() {
+            return Some(node);
         }
         if let Some(probe) = broadcast_probe(node, broadcast_bytes) {
             node = probe;
@@ -583,7 +599,9 @@ fn scan_left_here(
                 build
             };
             return if !split::zarr_scans(other).unwrap_or_default().is_empty() {
-                "two Zarr scans are joined, which would need fragments of two scans".to_string()
+                "two Zarr scans are joined, which needs the build side read row by row \
+                 and joined on every coordinate the two share"
+                    .to_string()
             } else if Arc::ptr_eq(build, child) {
                 "a Zarr scan is a join's build side: write the smaller side first".to_string()
             } else if contains_fan_out(other) {
@@ -648,15 +666,197 @@ fn broadcast_probe(
     node: &Arc<dyn ExecutionPlan>,
     broadcast_bytes: usize,
 ) -> Option<&Arc<dyn ExecutionPlan>> {
-    let (join_type, build, probe) = if let Some(join) = node.downcast_ref::<NestedLoopJoinExec>() {
-        (join.join_type(), join.left(), join.right())
-    } else {
-        let join = node
-            .downcast_ref::<HashJoinExec>()
-            .filter(|j| *j.partition_mode() == PartitionMode::CollectLeft)?;
-        (join.join_type(), join.left(), join.right())
+    if let Some(join) = node.downcast_ref::<NestedLoopJoinExec>() {
+        let sent = broadcastable(join.left(), broadcast_bytes);
+        return (*join.join_type() == JoinType::Inner && sent).then_some(join.right());
+    }
+    let join = node.downcast_ref::<HashJoinExec>()?;
+    let sent = match join.partition_mode() {
+        PartitionMode::CollectLeft => {
+            broadcastable(join.left(), broadcast_bytes) || !joined_axes(join).is_empty()
+        }
+        PartitionMode::Partitioned => !joined_axes(join).is_empty(),
+        PartitionMode::Auto => false,
     };
-    (*join_type == JoinType::Inner && broadcastable(build, broadcast_bytes)).then_some(probe)
+    (*join.join_type() == JoinType::Inner && sent).then_some(join.right())
+}
+
+/// A join's build side read from another Zarr scan: each invocation reads the
+/// box of it that its own chunks can join with.
+#[derive(Debug, Clone)]
+struct JoinedScan {
+    scan: Arc<dyn ExecutionPlan>,
+    /// The coordinates the join equates, as (probe's, this scan's).
+    axes: Vec<(String, String)>,
+    /// The most an invocation's box of it may take in memory.
+    max_bytes: usize,
+}
+
+/// The joins between `partial` and the `probe` scan whose build sides are Zarr
+/// scans, in the order they are passed.
+fn joined_scans(
+    partial: &Arc<dyn ExecutionPlan>,
+    probe: &Arc<dyn ExecutionPlan>,
+    max_bytes: usize,
+) -> Vec<JoinedScan> {
+    let mut joined = vec![];
+    let mut node = partial;
+    while !Arc::ptr_eq(node, probe) {
+        if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+            let axes = joined_axes(join);
+            if let (false, Some(scan)) = (axes.is_empty(), row_source(join.left())) {
+                joined.push(JoinedScan {
+                    scan: scan.clone(),
+                    axes,
+                    max_bytes,
+                });
+            }
+            node = join.right();
+            continue;
+        }
+        match node.children()[..] {
+            [child] => node = child,
+            _ => break,
+        }
+    }
+    joined
+}
+
+/// The coordinates an inner hash join equates between a Zarr scan on its build
+/// side, read row by row, and one on its probe side, as (probe's, build's);
+/// none unless it equates every coordinate the two share, as an invocation
+/// would otherwise read all of the build's along the others.
+fn joined_axes(join: &HashJoinExec) -> Vec<(String, String)> {
+    let coords = |plan: Option<&Arc<dyn ExecutionPlan>>| -> Vec<String> {
+        plan.and_then(|p| p.downcast_ref::<ZarrExec>())
+            .and_then(ZarrExec::store_meta)
+            .map(|meta| meta.coords.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default()
+    };
+    let build = coords(row_source(join.left()));
+    if build.is_empty() {
+        return vec![];
+    }
+    let axes: Vec<(String, String)> = join
+        .on()
+        .iter()
+        .filter_map(|(build, probe)| {
+            let build = build.downcast_ref::<Column>()?;
+            let probe = probe.downcast_ref::<Column>()?;
+            Some((
+                scan_coordinate(join.right(), probe.index())?,
+                scan_coordinate(join.left(), build.index())?,
+            ))
+        })
+        .collect();
+    let probe = coords(probe_scan(join.right()));
+    let unjoined = build
+        .iter()
+        .filter(|c| probe.contains(c))
+        .any(|c| !axes.iter().any(|(_, b)| b == c));
+    if unjoined {
+        return vec![];
+    }
+    axes
+}
+
+/// The Zarr scan whose chunks `plan` is dealt by, through its joins' probe
+/// sides.
+fn probe_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
+    let mut node = plan;
+    loop {
+        if node.is::<ZarrExec>() {
+            return Some(node);
+        }
+        if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+            node = join.right();
+            continue;
+        }
+        match node.children()[..] {
+            [child] => node = child,
+            _ => return None,
+        }
+    }
+}
+
+/// The Zarr scan `plan` reads row by row, with no aggregate or join between.
+fn row_source(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
+    let mut node = plan;
+    loop {
+        if node.is::<ZarrExec>() {
+            return Some(node);
+        }
+        let rowwise = node.is::<ProjectionExec>()
+            || node.is::<FilterExec>()
+            || node.is::<RepartitionExec>()
+            || node.is::<CoalescePartitionsExec>()
+            || node.is::<CooperativeExec>();
+        match node.children()[..] {
+            [child] if rowwise => node = child,
+            _ => return None,
+        }
+    }
+}
+
+/// The coordinate of the Zarr scan under `plan` that `plan`'s column `index`
+/// passes on unchanged, if it is one.
+fn scan_coordinate(plan: &Arc<dyn ExecutionPlan>, mut index: usize) -> Option<String> {
+    let mut node = plan;
+    loop {
+        if let Some(scan) = node.downcast_ref::<ZarrExec>() {
+            let schema = node.schema();
+            let name = schema.field(index).name();
+            let coords = &scan.store_meta()?.coords;
+            return coords.iter().any(|c| c.name == *name).then(|| name.clone());
+        }
+        if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
+            index = projection.expr()[index]
+                .expr
+                .downcast_ref::<Column>()?
+                .index();
+        } else if let Some(filter) = node.downcast_ref::<FilterExec>() {
+            if let Some(projection) = filter.projection() {
+                index = projection[index];
+            }
+        } else if !(node.is::<RepartitionExec>()
+            || node.is::<CoalescePartitionsExec>()
+            || node.is::<CooperativeExec>())
+        {
+            return None;
+        }
+        let [child] = node.children()[..] else {
+            return None;
+        };
+        node = child;
+    }
+}
+
+/// `fragment` with each join whose build side is a Zarr scan collecting that
+/// side whole, as an invocation's box of it is small, rather than
+/// repartitioning both sides by key for this process's cores.
+fn collect_left(fragment: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    let unhashed = |plan: &Arc<dyn ExecutionPlan>| match plan.downcast_ref::<RepartitionExec>() {
+        Some(r) if matches!(r.partitioning(), Partitioning::Hash(..)) => r.input().clone(),
+        _ => plan.clone(),
+    };
+    fragment
+        .transform_up(|node| {
+            let Some(join) = node
+                .downcast_ref::<HashJoinExec>()
+                .filter(|j| *j.partition_mode() == PartitionMode::Partitioned)
+                .filter(|j| !joined_axes(j).is_empty())
+            else {
+                return Ok(Transformed::no(node));
+            };
+            let build = Arc::new(CoalescePartitionsExec::new(unhashed(join.left())));
+            let collected = join
+                .builder()
+                .with_new_children(vec![build, unhashed(join.right())])?
+                .with_partition_mode(PartitionMode::CollectLeft)
+                .build_exec()?;
+            Ok(Transformed::yes(collected))
+        })
+        .map(|t| t.data)
 }
 
 /// Whether `build` reads only rows held here, few enough to travel in the
@@ -944,6 +1144,8 @@ pub struct MapLambdaZarrExec {
     finished: bool,
     /// What the dispatchers merge the workers' partial rows with, if they do.
     reduce: Option<String>,
+    /// The joins' build sides read from other Zarr scans.
+    joined: Vec<JoinedScan>,
     fan_out: Arc<FanOut>,
     properties: Arc<PlanProperties>,
     report: Arc<Mutex<Report>>,
@@ -972,6 +1174,7 @@ impl MapLambdaZarrExec {
             whole_groups,
             finished: false,
             reduce: None,
+            joined: vec![],
             fan_out,
             properties,
             report: Default::default(),
@@ -999,6 +1202,14 @@ impl MapLambdaZarrExec {
             .collect()
     }
 
+    /// The scan the runs are chunks of: the one no join reads as its build side.
+    fn probe(&self) -> Option<Arc<dyn ExecutionPlan>> {
+        split::zarr_scans(&self.plan)
+            .ok()?
+            .into_iter()
+            .find(|scan| !self.joined.iter().any(|j| Arc::ptr_eq(&j.scan, scan)))
+    }
+
     fn chunks(&self) -> usize {
         self.runs.iter().map(Vec::len).sum()
     }
@@ -1011,9 +1222,9 @@ impl MapLambdaZarrExec {
         let Some(tile) = self.runs.first().and_then(|run| run.first()) else {
             return false;
         };
-        let scans = split::zarr_scans(&self.plan).unwrap_or_default();
-        let Some(meta) = scans
-            .first()
+        let probe = self.probe();
+        let Some(meta) = probe
+            .as_ref()
             .and_then(|scan| scan.downcast_ref::<ZarrExec>())
             .and_then(ZarrExec::store_meta)
         else {
@@ -1022,16 +1233,17 @@ impl MapLambdaZarrExec {
         let Some(var) = meta.data_vars.first() else {
             return false;
         };
-        // Invocations split the inner axes a tile is cut along, or else the outer.
-        let split: Vec<usize> = if tile.extra.is_empty() {
-            let outer = var.dimensions.as_ref().and_then(|dims| dims.first());
-            match outer.and_then(|name| meta.coords.iter().position(|c| &c.name == name)) {
-                Some(coord) => vec![coord],
-                None => return false,
-            }
-        } else {
-            tile.extra.iter().map(|(coord, _)| *coord).collect()
+        let outer = var.dimensions.as_ref().and_then(|dims| dims.first());
+        let Some(outer) = outer.and_then(|name| meta.coords.iter().position(|c| &c.name == name))
+        else {
+            return false;
         };
+        // Invocations split the inner axes a tile is cut along, and the outer
+        // too if a tile's chunks span invocations, or else the outer alone.
+        let mut split: Vec<usize> = tile.extra.iter().map(|(coord, _)| *coord).collect();
+        if split.is_empty() || self.tiles_span_runs() {
+            split.push(outer);
+        }
         split.iter().all(|coord| {
             let name = &meta.coords[*coord].name;
             let source_chunk = var
@@ -1051,6 +1263,21 @@ impl MapLambdaZarrExec {
         })
     }
 
+    /// Whether some tile's chunks are in more than one run.
+    fn tiles_span_runs(&self) -> bool {
+        let key = |selection: &CoordSelection| match selection {
+            CoordSelection::Range(start, end) => (false, vec![*start, *end]),
+            CoordSelection::Indices(indices) => (true, indices.clone()),
+        };
+        let mut run_of = HashMap::new();
+        self.runs.iter().enumerate().any(|(i, run)| {
+            run.iter().any(|spec| {
+                let tile: Vec<_> = spec.extra.iter().map(|(c, s)| (*c, key(s))).collect();
+                *run_of.entry(tile).or_insert(i) != i
+            })
+        })
+    }
+
     /// The runs re-dealt so that each invocation writes whole chunks of `spec`
     /// along the outer axis, about as many hours each as before, for a fan-out
     /// split along it alone. A source chunk an output chunk boundary crosses is
@@ -1060,14 +1287,40 @@ impl MapLambdaZarrExec {
         if specs.iter().any(|s| !s.extra.is_empty()) {
             return None;
         }
-        let scans = split::zarr_scans(&self.plan).ok()?;
-        let meta = scans.first()?.downcast_ref::<ZarrExec>()?.store_meta()?;
+        let ranges = specs.iter().map(|s| s.as_range()).collect::<Option<_>>()?;
+        let (chunks, per_run) = self.output_time_chunks(spec, ranges)?;
+        Some(
+            chunks
+                .chunks(per_run)
+                .map(|run| {
+                    run.iter()
+                        .flatten()
+                        .map(|outer| PartitionSpec {
+                            outer: outer.clone(),
+                            extra: vec![],
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+
+    /// The outer `ranges` the runs read cut at `spec`'s chunks along it, in
+    /// order, and how many of those chunks a run is to take, to read about as
+    /// many hours of a tile as before; if `spec` has the outer axis, and the
+    /// ranges select its indexes with no gaps.
+    fn output_time_chunks(
+        &self,
+        spec: &SkeletonSpec,
+        mut ranges: Vec<(usize, usize)>,
+    ) -> Option<(Vec<Vec<CoordSelection>>, usize)> {
+        let probe = self.probe()?;
+        let meta = probe.downcast_ref::<ZarrExec>()?.store_meta()?;
         let outer = meta.data_vars.first()?.dimensions.as_ref()?.first()?;
         let axis = spec.coords.iter().position(|c| &c.name == outer)?;
         let chunk = usize::try_from(spec.chunks[axis]).ok().filter(|&c| c > 0)?;
-        let mut ranges: Vec<(usize, usize)> =
-            specs.iter().map(|s| s.as_range()).collect::<Option<_>>()?;
         ranges.sort();
+        ranges.dedup();
         let first = ranges.first()?.0;
         // The output's axis is the scan's selection, so output index i is source
         // index first + i, but only if the selection has no gaps.
@@ -1076,48 +1329,45 @@ impl MapLambdaZarrExec {
         if !contiguous || selected != spec.coords[axis].values.len() {
             return None;
         }
-        let mut by_chunk: BTreeMap<usize, Vec<PartitionSpec>> = BTreeMap::new();
+        let mut by_chunk: BTreeMap<usize, Vec<CoordSelection>> = BTreeMap::new();
         for (start, end) in ranges {
             let mut at = start;
             while at < end {
                 let k = (at - first) / chunk;
                 let to = end.min(first + (k + 1) * chunk);
-                by_chunk.entry(k).or_default().push(PartitionSpec {
-                    outer: CoordSelection::Range(at, to),
-                    extra: vec![],
-                });
+                by_chunk
+                    .entry(k)
+                    .or_default()
+                    .push(CoordSelection::Range(at, to));
                 at = to;
             }
         }
-        let per_run: usize = self
-            .runs
-            .first()?
+        // a tile's hours in the first run, which a run of no tiles has all of
+        let run = self.runs.first()?;
+        let tile = &run.first()?.extra;
+        let per_run: usize = run
             .iter()
+            .filter(|s| &s.extra == tile)
             .filter_map(|s| s.as_range())
             .map(|(s, e)| e - s)
             .sum();
-        let chunks_per_run = (per_run / chunk).max(1);
-        let chunks: Vec<_> = by_chunk.into_values().collect();
-        Some(
-            chunks
-                .chunks(chunks_per_run)
-                .map(|run| run.concat())
-                .collect(),
-        )
+        Some((by_chunk.into_values().collect(), (per_run / chunk).max(1)))
     }
 
     /// The runs re-dealt so that each invocation writes one of `spec`'s chunks
-    /// over the inner axes the tiles are cut along, through all of time, for a
-    /// fan-out dealt by tile. Each reads its box from whichever tiles it overlaps:
-    /// a cell lies in one box, so its groups stay whole.
+    /// over the inner axes the tiles are cut along, for a fan-out dealt by
+    /// tile: through all of time, or if the output has a time axis, through a
+    /// run of its chunks along it, about as many hours as before. Each reads its
+    /// box from whichever tiles it overlaps: a cell lies in one box, so its
+    /// groups stay whole.
     fn runs_by_output_box(&self, spec: &SkeletonSpec) -> Option<Vec<Vec<PartitionSpec>>> {
         let specs: Vec<&PartitionSpec> = self.runs.iter().flatten().collect();
         let first = specs.first()?;
         if first.extra.is_empty() {
             return None;
         }
-        let scans = split::zarr_scans(&self.plan).ok()?;
-        let meta = scans.first()?.downcast_ref::<ZarrExec>()?.store_meta()?;
+        let probe = self.probe()?;
+        let meta = probe.downcast_ref::<ZarrExec>()?.store_meta()?;
         // The output's chunks along each axis the tiles are cut on, which must
         // cover the whole source axis, so that output and source indexes agree.
         let mut axes: Vec<(usize, Vec<(usize, usize)>)> = vec![];
@@ -1141,6 +1391,20 @@ impl MapLambdaZarrExec {
                 outers.push(spec.outer.clone());
             }
         }
+        let has_time = meta
+            .data_vars
+            .first()?
+            .dimensions
+            .as_ref()?
+            .first()
+            .is_some_and(|outer| spec.coords.iter().any(|c| &c.name == outer));
+        let times: Vec<Vec<CoordSelection>> = if has_time {
+            let ranges = outers.iter().map(|o| o.as_range()).collect::<Option<_>>()?;
+            let (chunks, per_run) = self.output_time_chunks(spec, ranges)?;
+            chunks.chunks(per_run).map(<[_]>::concat).collect()
+        } else {
+            vec![outers]
+        };
         let mut boxes: Vec<Vec<(usize, CoordSelection)>> = vec![vec![]];
         for (coord, pieces) in axes {
             boxes = boxes
@@ -1156,15 +1420,17 @@ impl MapLambdaZarrExec {
         }
         Some(
             boxes
-                .into_iter()
-                .map(|extra| {
-                    outers
-                        .iter()
-                        .map(|outer| PartitionSpec {
-                            outer: outer.clone(),
-                            extra: extra.clone(),
-                        })
-                        .collect()
+                .iter()
+                .flat_map(|extra| {
+                    times.iter().map(move |outers| {
+                        outers
+                            .iter()
+                            .map(|outer| PartitionSpec {
+                                outer: outer.clone(),
+                                extra: extra.clone(),
+                            })
+                            .collect()
+                    })
                 })
                 .collect(),
         )
@@ -1257,6 +1523,223 @@ impl From<CombineBatch> for Arrival {
     }
 }
 
+/// Each run's chunks of `plan`'s scans, a list a scan in `split::zarr_scans`'s
+/// order: the probe's chunks, and each joined scan's box of them. A run whose
+/// rows join none of a joined scan's is left out.
+async fn joined_inputs(
+    plan: &Arc<dyn ExecutionPlan>,
+    runs: &[Vec<PartitionSpec>],
+    joined: &[JoinedScan],
+) -> Result<Vec<Value>> {
+    let scans = split::zarr_scans(plan)?;
+    let joined_at =
+        |scan: &Arc<dyn ExecutionPlan>| joined.iter().position(|j| Arc::ptr_eq(&j.scan, scan));
+    let [probe] = scans
+        .iter()
+        .filter(|scan| joined_at(scan).is_none())
+        .collect::<Vec<_>>()[..]
+    else {
+        return Err(DataFusionError::Plan(
+            "a fragment's joins have no single probe scan".into(),
+        ));
+    };
+    let names: Vec<String> = joined
+        .iter()
+        .flat_map(|j| j.axes.iter().map(|(probe, _)| probe.clone()))
+        .collect();
+    let probe = Grid::read(probe, &names).await?;
+    let mut grids = vec![];
+    for j in joined {
+        let names: Vec<String> = j.axes.iter().map(|(_, build)| build.clone()).collect();
+        grids.push(Grid::read(&j.scan, &names).await?);
+    }
+    let mut inputs = vec![];
+    'runs: for run in runs {
+        let mut lists = vec![];
+        for scan in &scans {
+            let Some(i) = joined_at(scan) else {
+                lists.push(run.clone());
+                continue;
+            };
+            let boxes = joined_boxes(run, &probe, &grids[i], &joined[i].axes);
+            if boxes.is_empty() {
+                continue 'runs;
+            }
+            let row: usize = scan
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| match field.data_type() {
+                    DataType::Dictionary(key, _) => key.primitive_width(),
+                    other => other.primitive_width(),
+                })
+                .sum::<Option<usize>>()
+                .unwrap_or(0);
+            let bytes = boxes.iter().map(|b| grids[i].cells(b)).sum::<usize>() * row;
+            if bytes > joined[i].max_bytes {
+                return Err(DataFusionError::Plan(format!(
+                    "an invocation would read {} MB of a joined Zarr scan, at most \
+                     lambda.broadcast_bytes: join it on more of its coordinates",
+                    bytes / 1_000_000
+                )));
+            }
+            lists.push(boxes);
+        }
+        inputs.push(Value::from(
+            lists
+                .iter()
+                .map(|list| to_value(&split::compact::compact(list)))
+                .collect::<Vec<_>>(),
+        ));
+    }
+    Ok(inputs)
+}
+
+/// A scan's store: its metadata, and the values of the coordinates needed.
+struct Grid {
+    meta: ZarrStoreMeta,
+    values: HashMap<String, Vec<f64>>,
+}
+
+impl Grid {
+    async fn read(scan: &Arc<dyn ExecutionPlan>, names: &[String]) -> Result<Self> {
+        let scan = scan.downcast_ref::<ZarrExec>().expect("a Zarr scan");
+        let meta = scan
+            .store_meta()
+            .ok_or_else(|| DataFusionError::Plan(format!("{} has no metadata", scan.path())))?
+            .clone();
+        let mut values = HashMap::new();
+        for name in names {
+            if !values.contains_key(name) {
+                values.insert(name.clone(), split::coordinate_values(scan, name).await?);
+            }
+        }
+        Ok(Self { meta, values })
+    }
+
+    /// The coordinate index that a partition's outer selection is on.
+    fn outer(&self) -> Option<usize> {
+        let name = self.meta.data_vars.first()?.dimensions.as_ref()?.first()?;
+        self.meta.coords.iter().position(|c| &c.name == name)
+    }
+
+    /// The cells of its first variable that `spec` selects.
+    fn cells(&self, spec: &PartitionSpec) -> usize {
+        let Some(dims) = self
+            .meta
+            .data_vars
+            .first()
+            .and_then(|v| v.dimensions.as_ref())
+        else {
+            return 0;
+        };
+        dims.iter()
+            .map(|name| {
+                let coord = self.index(name);
+                match self.selection(spec, coord) {
+                    Some(CoordSelection::Range(start, end)) => end - start,
+                    Some(CoordSelection::Indices(indices)) => indices.len(),
+                    None => coord
+                        .and_then(|c| self.meta.coords[c].shape.first().copied())
+                        .unwrap_or(0) as usize,
+                }
+            })
+            .product()
+    }
+
+    /// `spec`'s selection on `coord`, if it makes one.
+    fn selection<'a>(
+        &self,
+        spec: &'a PartitionSpec,
+        coord: Option<usize>,
+    ) -> Option<&'a CoordSelection> {
+        if coord == self.outer() {
+            return Some(&spec.outer);
+        }
+        spec.extra
+            .iter()
+            .find(|(c, _)| Some(*c) == coord)
+            .map(|(_, selection)| selection)
+    }
+
+    fn index(&self, name: &str) -> Option<usize> {
+        self.meta.coords.iter().position(|c| c.name == name)
+    }
+
+    /// The values `spec` selects of coordinate `name`, all of them if it
+    /// selects none.
+    fn selected(&self, spec: &PartitionSpec, name: &str) -> Vec<f64> {
+        let values = &self.values[name];
+        match self.selection(spec, self.index(name)) {
+            Some(CoordSelection::Range(start, end)) => values[*start..*end].to_vec(),
+            Some(CoordSelection::Indices(indices)) => indices.iter().map(|&i| values[i]).collect(),
+            None => values.clone(),
+        }
+    }
+}
+
+/// The boxes of `build`'s store that `run`'s chunks of `probe`'s can join with:
+/// along each of `axes`, the build's values within the span of those the
+/// probe's chunk selects, and along any other axis, all of it. A chunk with no
+/// such values along some axis joins nothing, so has no box.
+fn joined_boxes(
+    run: &[PartitionSpec],
+    probe: &Grid,
+    build: &Grid,
+    axes: &[(String, String)],
+) -> Vec<PartitionSpec> {
+    let mut boxes: Vec<PartitionSpec> = vec![];
+    let Some(outer) = build.outer() else {
+        return boxes;
+    };
+    'chunks: for spec in run {
+        let extent =
+            |coord: usize| build.meta.coords[coord].shape.first().copied().unwrap_or(0) as usize;
+        let mut joined = PartitionSpec {
+            outer: CoordSelection::Range(0, extent(outer)),
+            extra: vec![],
+        };
+        for (probe_name, build_name) in axes {
+            let span = probe
+                .selected(spec, probe_name)
+                .into_iter()
+                .filter(|v| !v.is_nan())
+                .fold(None, |span: Option<(f64, f64)>, v| {
+                    Some(span.map_or((v, v), |(low, high)| (low.min(v), high.max(v))))
+                });
+            let Some((low, high)) = span else {
+                continue 'chunks;
+            };
+            let within: Vec<usize> = build.values[build_name]
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| (low..=high).contains(*v))
+                .map(|(i, _)| i)
+                .collect();
+            let selection = match within[..] {
+                [] => continue 'chunks,
+                [first, .., last] | [first @ last] if last - first + 1 == within.len() => {
+                    CoordSelection::Range(first, last + 1)
+                }
+                _ => CoordSelection::Indices(within),
+            };
+            let Some(coord) = build.index(build_name) else {
+                continue 'chunks;
+            };
+            if coord == outer {
+                joined.outer = selection;
+            } else {
+                joined.extra.push((coord, selection));
+            }
+        }
+        joined.extra.sort_by_key(|(coord, _)| *coord);
+        if !boxes.contains(&joined) {
+            boxes.push(joined);
+        }
+    }
+    boxes
+}
+
 fn decode(output: &Value) -> Result<Vec<RecordBatch>> {
     let batches = output["batches"].as_str().ok_or_else(|| {
         DataFusionError::Execution(format!("a fragment answered without batches: {output}"))
@@ -1289,15 +1772,17 @@ impl ExecutionPlan for MapLambdaZarrExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let inputs = self.inputs();
+        // With a joined scan, its boxes are found once the coordinates are read.
+        let inputs = self.joined.is_empty().then(|| self.inputs());
         *self.report.lock().expect("unpoisoned") = Report {
             chunks: self.chunks(),
-            invocations: inputs.len(),
+            invocations: inputs.as_ref().map_or(0, Vec::len),
             ..Report::default()
         };
-        if inputs.is_empty() {
+        if inputs.as_ref().is_some_and(Vec::is_empty) {
             return Ok(self.answer(futures::stream::empty().boxed()));
         }
+        let joined = (self.plan.clone(), self.runs.clone(), self.joined.clone());
 
         let settings = &self.fan_out.settings;
         let locations = if settings.endpoint_url.is_some() {
@@ -1325,7 +1810,8 @@ impl ExecutionPlan for MapLambdaZarrExec {
         });
         let combined = combine.is_some();
         let on_progress = self.fan_out.on_progress.clone();
-        let total = inputs.len();
+        let total = Arc::new(AtomicUsize::new(inputs.as_ref().map_or(0, Vec::len)));
+        let (planned, counted) = (self.report.clone(), total.clone());
         // The workers each write their own chunks to a store made here first.
         let store = self
             .plan
@@ -1334,6 +1820,20 @@ impl ExecutionPlan for MapLambdaZarrExec {
             .map(|zarr| (zarr.store_path().to_string(), zarr.spec().clone()));
         let run = futures::stream::once(async move {
             region::check(&locations).await?;
+            let inputs = match inputs {
+                Some(inputs) => inputs,
+                None => {
+                    let (plan, runs, joined) = joined;
+                    let inputs = joined_inputs(&plan, &runs, &joined).await?;
+                    counted.store(inputs.len(), Ordering::Relaxed);
+                    planned.lock().expect("unpoisoned").invocations = inputs.len();
+                    inputs
+                }
+            };
+            if inputs.is_empty() {
+                return Ok(futures::stream::empty().boxed());
+            }
+            let total = counted.load(Ordering::Relaxed);
             if let Some((path, spec)) = store {
                 tokio::task::spawn_blocking(move || create_skeleton(&path, &spec))
                     .await
@@ -1356,7 +1856,7 @@ impl ExecutionPlan for MapLambdaZarrExec {
                     .map_ok(Arrival::from)
                     .boxed(),
             };
-            Ok::<_, DataFusionError>(arrivals.map_err(external))
+            Ok::<_, DataFusionError>(arrivals.map_err(external).boxed())
         })
         .try_flatten();
         let report = self.report.clone();
@@ -1368,7 +1868,7 @@ impl ExecutionPlan for MapLambdaZarrExec {
             .and_then(move |arrival| {
                 if let (Some(on_progress), 1..) = (&on_progress, arrival.succeeded) {
                     succeeded += arrival.succeeded;
-                    on_progress(succeeded, total);
+                    on_progress(succeeded, total.load(Ordering::Relaxed));
                 }
                 let decoded = arrival
                     .responses
@@ -1454,6 +1954,181 @@ impl MapLambdaZarrExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn array(name: &str, shape: &[u64], dims: &[&str]) -> ZarrArrayMeta {
+        ZarrArrayMeta {
+            name: name.into(),
+            data_type: "float64".into(),
+            shape: shape.to_vec(),
+            chunks: None,
+            coord_min_max: None,
+            cf_time_attrs: None,
+            dimensions: Some(dims.iter().map(|d| d.to_string()).collect()),
+        }
+    }
+
+    /// A store of `var` over `axes`, each a coordinate with its values, the
+    /// first the outer.
+    fn grid(var: &str, axes: &[(&str, Vec<f64>)]) -> Grid {
+        let dims: Vec<&str> = axes.iter().map(|(name, _)| *name).collect();
+        let shape: Vec<u64> = axes.iter().map(|(_, v)| v.len() as u64).collect();
+        let mut coords: Vec<_> = axes
+            .iter()
+            .map(|(name, v)| array(name, &[v.len() as u64], &[name]))
+            .collect();
+        coords.sort_by(|a, b| a.name.cmp(&b.name));
+        Grid {
+            meta: ZarrStoreMeta {
+                coords,
+                data_vars: vec![array(var, &shape, &dims)],
+                total_rows: 0,
+            },
+            values: axes
+                .iter()
+                .map(|(name, v)| (name.to_string(), v.clone()))
+                .collect(),
+        }
+    }
+
+    fn steps(start: f64, step: f64, n: usize) -> Vec<f64> {
+        (0..n).map(|i| start + step * i as f64).collect()
+    }
+
+    /// ERA5-like: 10° cells, latitude descending; and a climatology of its
+    /// 30°N to 50°N, 240°E to 290°E, by hour.
+    fn era5_and_climatology() -> (Grid, Grid) {
+        let era5 = grid(
+            "t2m",
+            &[
+                ("time", steps(0.0, 1.0, 100)),
+                ("latitude", steps(90.0, -10.0, 19)),
+                ("longitude", steps(0.0, 10.0, 36)),
+            ],
+        );
+        let clim = grid(
+            "clim_t",
+            &[
+                ("hour", steps(0.0, 1.0, 24)),
+                ("latitude", steps(50.0, -10.0, 3)),
+                ("longitude", steps(240.0, 10.0, 6)),
+            ],
+        );
+        (era5, clim)
+    }
+
+    fn axes() -> Vec<(String, String)> {
+        ["latitude", "longitude"]
+            .map(|a| (a.to_string(), a.to_string()))
+            .to_vec()
+    }
+
+    fn tile(
+        era5: &Grid,
+        time: (usize, usize),
+        lat: (usize, usize),
+        lon: (usize, usize),
+    ) -> PartitionSpec {
+        PartitionSpec {
+            outer: CoordSelection::Range(time.0, time.1),
+            extra: vec![
+                (
+                    era5.index("latitude").unwrap(),
+                    CoordSelection::Range(lat.0, lat.1),
+                ),
+                (
+                    era5.index("longitude").unwrap(),
+                    CoordSelection::Range(lon.0, lon.1),
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_tiles_chunks_join_the_box_of_the_other_store_over_its_cells() {
+        let (era5, clim) = era5_and_climatology();
+        // 50°N to 10°N by 250°E to 300°E, over two pencils of time
+        let run = [
+            tile(&era5, (0, 50), (4, 9), (25, 31)),
+            tile(&era5, (50, 100), (4, 9), (25, 31)),
+        ];
+
+        let boxes = joined_boxes(&run, &era5, &clim, &axes());
+
+        // every hour of 50°N to 30°N by 250°E to 290°E: the one box for both
+        assert_eq!(
+            boxes,
+            [PartitionSpec {
+                outer: CoordSelection::Range(0, 24),
+                extra: vec![
+                    (clim.index("latitude").unwrap(), CoordSelection::Range(0, 3)),
+                    (
+                        clim.index("longitude").unwrap(),
+                        CoordSelection::Range(1, 6)
+                    ),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_whole_globe_chunk_joins_all_of_the_other_store() {
+        let (era5, clim) = era5_and_climatology();
+        let run = [PartitionSpec {
+            outer: CoordSelection::Range(0, 24),
+            extra: vec![],
+        }];
+
+        let boxes = joined_boxes(&run, &era5, &clim, &axes());
+
+        assert_eq!(
+            boxes,
+            [PartitionSpec {
+                outer: CoordSelection::Range(0, 24),
+                extra: vec![
+                    (clim.index("latitude").unwrap(), CoordSelection::Range(0, 3)),
+                    (
+                        clim.index("longitude").unwrap(),
+                        CoordSelection::Range(0, 6)
+                    ),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_tile_outside_the_other_store_joins_nothing() {
+        let (era5, clim) = era5_and_climatology();
+        // the tropics
+        let run = [tile(&era5, (0, 50), (8, 11), (25, 31))];
+
+        assert_eq!(joined_boxes(&run, &era5, &clim, &axes()), []);
+    }
+
+    #[test]
+    fn values_within_the_span_but_not_contiguous_are_picked_out() {
+        let (era5, _) = era5_and_climatology();
+        let clim = grid(
+            "clim_t",
+            &[
+                ("hour", steps(0.0, 1.0, 24)),
+                ("latitude", vec![50.0, -50.0, 40.0]),
+                ("longitude", steps(240.0, 10.0, 6)),
+            ],
+        );
+        let run = [tile(&era5, (0, 50), (4, 6), (24, 30))];
+
+        let [joined] = &joined_boxes(&run, &era5, &clim, &axes())[..] else {
+            panic!("one box");
+        };
+
+        assert_eq!(
+            joined.extra[0],
+            (
+                clim.index("latitude").unwrap(),
+                CoordSelection::Indices(vec![0, 2])
+            )
+        );
+    }
 
     #[test]
     fn a_table_is_created_with_its_options_quoted() {
