@@ -6,6 +6,67 @@ How fast can we query ERA5 Zarr data using SQL and the [map-lambda](https://gith
 1940 to 2025 (3.1 TB uncompressed), written to Zarr on S3, takes ~136s and
 costs ~$3.07**
 
+See [quickstart](#quickstart) to run it yourself, or [benchmarks](#benchmarks)
+for the time and costs for running other ERA5 queries.
+
+## How it works
+
+A query is planned by [Apache DataFusion](https://datafusion.apache.org/), over Zarr
+arrays flattened into tables by [zarr-datafusion](https://github.com/stratoscale-io/zarr-datafusion).
+
+The plan is cut where its work can be done chunk by chunk, and that part is
+replaced by a new physical operator, `MapLambdaZarrExec`, which runs it on
+Lambda workers through map-lambda, each invocation reading its own run of
+chunks. What happens to the workers' results depends on the query:
+
+- **An aggregate:** each worker returns partial results, the dispatchers
+  merge them, and the client finishes the aggregate.
+- **An aggregate whose groups each lie in one invocation:** each worker
+  finishes its groups itself.
+- **`COPY … STORED AS ZARR`:** each worker writes its own chunks of the
+  output to S3, and returns only a count.
+- **A join:** a small table is sent to every worker, and another Zarr store
+  is read by each worker only where its own chunks join with it.
+
+Each benchmark's page says which of these it uses. A query that can't be
+split this way is refused, rather than run slowly in the client.
+
+This project is set up for running benchmarks, it is not a general purpose SQL engine.
+
+## Quickstart
+
+This deploys the lambdas to your AWS account and queries ERA5 from a Jupyter
+notebook. It needs [uv](https://docs.astral.sh/uv/), and AWS credentials,
+found as the `aws` CLI finds them. ERA5 is read anonymously from Earthmover's
+public bucket in us-east-1, which is where the lambdas are deployed too.
+
+Deploy the lambdas from the latest release:
+
+```shell
+export UV_FIND_LINKS=https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev2
+uvx --python 3.12 zarr-datafusion-lambda deploy
+```
+
+Download the notebook, and open it in Jupyter:
+
+```shell
+curl -LO https://raw.githubusercontent.com/tomwhite/zarr-datafusion-lambda/v0.1.0.dev2/examples/query.ipynb
+uv run --no-project --python 3.12 --with zarr-datafusion-lambda --with jupyterlab --with ipywidgets --with pandas jupyter lab query.ipynb
+```
+
+Run its cells: the first query is the daily global mean of the 2m
+temperature over a week of 2020. Edit it to query other windows, or print a
+query's plan with `sql.explain` before running it.
+
+The lambdas cost nothing while they aren't running, apart from storing their
+logs, so you can leave them deployed. To tidy up once you're done with them:
+
+```shell
+uvx --python 3.12 zarr-datafusion-lambda delete
+```
+
+## Benchmarks
+
 Each benchmark has a page explaining how it was run. This table is a summary.
 Note that some of the benchmarks have not been run on the whole ERA5 dataset,
 and have been run by restricting the time window to 5 or 10 years. It is
@@ -23,78 +84,11 @@ in time and cost.
 | [Anomaly](docs/benchmarks/anomaly.md) | joined with its climatology, written to Zarr first, and written to Zarr by the workers | 2019–2024 | 152s | $1.26 | xarray |
 | [Forecast skill](docs/benchmarks/forecast-skill.md) | joined with itself hours later, merged in the dispatchers | 2019–2023 | 78s | $1.69 | xarray |
 
-## How it works
+Each benchmark runs from a checkout, deployed [from source](#from-source),
+which builds the client from source too, and saves its run to `results/`,
+with a timeline of its invocations.
 
-A query is planned by [DataFusion](https://datafusion.apache.org/), over Zarr
-arrays flattened into tables by [zarr-datafusion](https://github.com/stratoscale-io/zarr-datafusion).
-
-A new physical operator `MapLambdaZarrExec` is used to run partial
-aggregates on Lambda workers. For the [global
-mean](docs/benchmarks/global-mean.md), the partial aggregate results for each
-worker are streamed back to the client which completes the rest of the plan.
-
-For the [zonal mean](docs/benchmarks/zonal-mean.md), every worker returns a
-partial row for every latitude, so the dispatchers merge them as they arrive
-and send the client one state each.
-
-For the [region statistics](docs/benchmarks/region-statistics.md), the boxes
-are a small table joined with the scan. Each worker is sent the table in its
-fragment and joins its own chunks with it, and the dispatchers merge the
-partial rows as for the zonal mean.
-
-For the [climatology](docs/benchmarks/climatology.md), each worker processes
-all of a group's rows, so it runs the final aggregate, and writes the output
-itself.
-
-For [regridding](docs/benchmarks/regridding.md), the weights are a table in
-S3, which each worker reads whole and joins its own chunks with. As for the
-climatology, each worker has all of a group's rows, an hour's, so it finishes
-the aggregate and writes the output itself.
-
-For the [wind speed](docs/benchmarks/wind-speed.md), there is no aggregate:
-each worker computes its own chunks' rows and writes them to the output, so
-only a count comes back.
-
-For the [anomaly](docs/benchmarks/anomaly.md), the climatology is written to
-Zarr first, and the query is joined with that store: each worker reads a
-pencil of ERA5 and the climatology's chunk over the same cells, and writes the
-pencil's chunk of the output itself.
-
-For the [forecast skill](docs/benchmarks/forecast-skill.md), ERA5 is joined
-with itself at each lead: each worker reads an hour of ERA5 as the forecast
-and the hours its leads reach as the truth, and returns a partial row for
-each lead, which the dispatchers merge.
-
-This project is set up for running benchmarks, it is not a general purpose SQL engine.
-
-## Dependencies
-
-map-lambda is pinned to a release: from PyPI for Python, and the release's
-tag for the Rust crates and the dispatchers, so that the client and
-dispatchers come from the same release. zarr-datafusion is built
-from a pinned commit on GitHub.
-
-zarr-datafusion comes from a fork, <https://github.com/tomwhite/zarr-datafusion>,
-pinned to a commit, until the changes it carries are merged upstream.
-
-## Running locally
-
-First start `cargo lambda watch` from the `rust/` directory, building first,
-because `watch` compiles a function on its first request, which would outlast
-the dispatcher's invoke timeout:
-
-```shell
-cd rust && cargo build && cargo lambda watch
-```
-
-Then, in another terminal, run the tests:
-
-```shell
-uv run pytest
-cd rust && cargo test
-```
-
-## Running on AWS
+## Deploying and querying
 
 The lambdas are deployed as the map-lambda project `zarr-datafusion-lambda`,
 described by `zarr_datafusion_lambda/deploy.toml`: one CloudFormation
@@ -104,17 +98,17 @@ partial rows, `zarr-datafusion-lambda-fragment`, their roles and their logs.
 
 The data is in us-east-1, so the workers must be there too (a query refuses
 to run otherwise), which the spec fixes. ERA5 is read anonymously, so a
-bucket only needs allowing for the climatology, which the workers write to.
+bucket only needs allowing for a query that writes to it, such as a `COPY …
+STORED AS ZARR`.
 
 ### From a release
 
-This needs only [uv](https://docs.astral.sh/uv/): the wheels and the lambda
-zips come from this project's [GitHub
-release](https://github.com/tomwhite/zarr-datafusion-lambda/releases), and
-map-lambda's wheel from its own:
+This needs only uv: the wheels and the lambda zips come from this project's
+[GitHub release](https://github.com/tomwhite/zarr-datafusion-lambda/releases),
+and map-lambda from PyPI:
 
 ```shell
-export UV_FIND_LINKS=https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev1,https://github.com/tomwhite/map-lambda/releases/expanded_assets/v0.1.0.dev1
+export UV_FIND_LINKS=https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev2
 uvx --python 3.12 zarr-datafusion-lambda deploy --allow-bucket <bucket>
 uvx --python 3.12 zarr-datafusion-lambda list      # what is deployed
 uvx --python 3.12 zarr-datafusion-lambda delete    # when you're finished; the bucket and its data stay
@@ -124,8 +118,8 @@ uvx --python 3.12 zarr-datafusion-lambda delete    # when you're finished; the b
 CloudShell.
 
 The same commands, and the query below, work in [AWS
-CloudShell](https://aws.amazon.com/cloudshell/), which has credentials
-already set, once uv is installed:
+CloudShell](https://console.aws.amazon.com/cloudshell/home?region=us-east-1),
+which has credentials already set, once uv is installed:
 
 ```shell
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -156,9 +150,8 @@ The workers are in us-east-1, so the client's region must be too:
 export AWS_REGION=us-east-1
 ```
 
-With the deployment from a release, and `UV_FIND_LINKS` as above, this
-queries a week of ERA5's 2 m temperature for its daily global mean, from the
-package's `sql` module:
+With the deployment from a release, and `UV_FIND_LINKS` as above, this runs
+the notebook's first query from a script, with the package's `sql` module:
 
 ```shell
 uv run --no-project --python 3.12 --with zarr-datafusion-lambda python - <<'EOF'
@@ -180,30 +173,49 @@ print(f"{result.chunks} chunks in {result.invocations} invocations")
 EOF
 ```
 
-To edit queries and see their plans, `examples/query.ipynb` runs the same
-query in Jupyter. From a release, having downloaded the notebook:
-
-```shell
-uv run --no-project --python 3.12 --with zarr-datafusion-lambda --with jupyterlab --with ipywidgets --with pandas jupyter lab
-```
-
-From a checkout, with the package built from source:
+From a checkout, with the package built from source, the notebook opens with:
 
 ```shell
 uv run --with jupyterlab --with ipywidgets --with pandas jupyter lab examples/query.ipynb
 ```
 
-Each [benchmark](#zarr-datafusion-lambda) runs from a checkout, which builds
-the client from source, and saves its run to `results/`, with a timeline of
-its invocations.
+## Development
 
-## Releasing
+### Running the tests locally
+
+First start `cargo lambda watch` from the `rust/` directory, building first,
+because `watch` compiles a function on its first request, which would outlast
+the dispatcher's invoke timeout:
+
+```shell
+cd rust && cargo build && cargo lambda watch
+```
+
+Then, in another terminal, run the tests:
+
+```shell
+uv run pytest
+cd rust && cargo test
+```
+
+### Dependencies
+
+map-lambda is pinned to a release: from PyPI for Python, and the release's
+tag for the Rust crates and the dispatchers, so that the client and
+dispatchers come from the same release. zarr-datafusion is built
+from a pinned commit on GitHub.
+
+zarr-datafusion comes from a fork, <https://github.com/tomwhite/zarr-datafusion>,
+pinned to a commit, until the changes it carries are merged upstream.
+
+### Releasing
 
 Set the version in `pyproject.toml` (`0.1.0.devN` for now), run `uv lock`,
 and push a tag of the same version prefixed with `v`. The release workflow
 builds the dispatchers' and fragment's zips, and wheels for Linux x86-64 and
 arm64 and macOS arm64 carrying the zips' checksums, then attaches them all to
-a GitHub release. Then update the release URLs under Running on AWS.
+a GitHub release. Then update the release URLs in the Quickstart and under Deploying and
+querying.
 
 ## AI usage
 

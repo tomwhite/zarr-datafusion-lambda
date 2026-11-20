@@ -44,11 +44,11 @@ GROUP BY f.lead_h
 ORDER BY f.lead_h
 ```
 
-The valid time is in a subquery, as DataFusion drops an `ON` condition on a
-column from an earlier `CROSS JOIN`. The truth and the leads are written
+The valid time is in a subquery, as Apache DataFusion drops an `ON` condition
+on a column from an earlier `CROSS JOIN`. The truth and the leads are written
 first, as DataFusion holds the table written first in memory: the leads are
-sent to every worker in its fragment, and the truth is read by each worker
-for its own chunks.
+sent to every worker in its fragment, and the truth is read by each worker for
+its own chunks.
 
 Each invocation reads an hour of the forecast and, for each lead, the hour of
 ERA5 it reaches, found from the times of the two and the leads, and joins
