@@ -85,13 +85,13 @@ from 2019-09-23 to 2024-09-16:
 ```shell
 uv run python benchmarks/anomaly.py s3://<bucket>/anomaly-5y.zarr \
     --climatology s3://<bucket>/anomaly-5y-climatology.zarr \
-    --start 2019-09-23 --end 2024-09-16 --dispatchers 2
+    --start 2019-09-23 --end 2024-09-16
 ```
 
 One dispatcher's request holds the inputs of about 30,000 invocations of the
 join, each naming its pencil and its box of the climatology, so five years
-needs two dispatchers. `--climatology-written` runs only the join, over a
-climatology written already for the same window.
+takes two dispatchers, which the client adds itself. `--climatology-written`
+runs only the join, over a climatology written already for the same window.
 
 The output is float32, about 5 MB a pencil before compression, 125 GiB for
 the five years, which costs about $3 a month to keep in S3 Standard:

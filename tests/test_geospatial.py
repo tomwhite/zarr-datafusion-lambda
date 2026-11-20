@@ -212,17 +212,19 @@ ORDER BY time, a.latitude DESC, a.longitude
 
 # Persistence: a week of the store as the forecast, against itself `lead` later.
 # The valid time is in a subquery: DataFusion drops an ON condition on a
-# column from an earlier CROSS JOIN, and in WHERE it isn't a join key.
+# column from an earlier CROSS JOIN, and in WHERE it isn't a join key. The
+# truth first, and the leads before the forecast, as a join is built from its
+# first table.
 PERSISTENCE_SKILL = """
 SELECT f.lead_h, sqrt(avg(power(f.t2m - e.t2m, 2))) AS rmse, count(*) AS n
-FROM (
+FROM era5 e
+JOIN (
     SELECT l.lead_h, latitude, longitude, t2m, CAST(time AS TIMESTAMP) + l.lead AS valid
-    FROM era5
-    CROSS JOIN (VALUES (6, INTERVAL '6 hours'), (24, INTERVAL '24 hours'),
-                       (72, INTERVAL '72 hours')) AS l(lead_h, lead)
+    FROM (VALUES (6, INTERVAL '6 hours'), (24, INTERVAL '24 hours'),
+                 (72, INTERVAL '72 hours')) AS l(lead_h, lead)
+    CROSS JOIN era5
     WHERE time < TIMESTAMP '1979-01-08 00:00:00'
 ) f
-JOIN era5 e
   ON e.latitude = f.latitude AND e.longitude = f.longitude AND CAST(e.time AS TIMESTAMP) = f.valid
 GROUP BY f.lead_h
 ORDER BY f.lead_h
@@ -275,7 +277,7 @@ CASES = {
     ),
     "derived-variable": Case(DERIVED_VARIABLE, None, derived_variable, variables=SURFACE),
     "anomaly": Case(ANOMALY, None, anomaly),
-    "persistence-skill": Case(PERSISTENCE_SKILL, None, persistence_skill),
+    "persistence-skill": Case(PERSISTENCE_SKILL, (PARTIAL,), persistence_skill),
     "region-statistics": Case(REGION_STATISTICS, (PARTIAL,), region_statistics),
     "reprojection": Case(REPROJECTION),
     "regridding": Case(REGRIDDING, (FINAL,), regridding, weights=True),
@@ -392,10 +394,6 @@ SHOULD = {
     "anomaly": (
         (MAP, PARTIAL),
         "a sliced broadcast: the climatology's slice joined with each probe fragment's chunks",
-    ),
-    "persistence-skill": (
-        (PARTIAL,),
-        "two-scan fragments, with the truth's chunks derived from the join predicate",
     ),
     "reprojection": ((MAP,), "UDFs in the worker, and map-only fragments"),
 }

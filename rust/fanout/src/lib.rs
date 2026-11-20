@@ -19,7 +19,7 @@ use datafusion::arrow::datatypes::UInt64Type;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{extensions_options, JoinType};
+use datafusion::common::{extensions_options, JoinType, ScalarValue};
 use datafusion::config::{ConfigExtension, ConfigOptions};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::FileScanConfig;
@@ -27,7 +27,8 @@ use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::expressions::{CastExpr, Column, TryCastExpr};
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::expressions::{BinaryExpr, CastExpr, Column, Literal, TryCastExpr};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -36,7 +37,9 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter::FilterExec;
-use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode};
+use datafusion::physical_plan::joins::{
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
+};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -670,6 +673,9 @@ fn broadcast_probe(
         let sent = broadcastable(join.left(), broadcast_bytes);
         return (*join.join_type() == JoinType::Inner && sent).then_some(join.right());
     }
+    if let Some(join) = node.downcast_ref::<CrossJoinExec>() {
+        return broadcastable(join.left(), broadcast_bytes).then_some(join.right());
+    }
     let join = node.downcast_ref::<HashJoinExec>()?;
     let sent = match join.partition_mode() {
         PartitionMode::CollectLeft => {
@@ -686,10 +692,26 @@ fn broadcast_probe(
 #[derive(Debug, Clone)]
 struct JoinedScan {
     scan: Arc<dyn ExecutionPlan>,
-    /// The coordinates the join equates, as (probe's, this scan's).
-    axes: Vec<(String, String)>,
+    axes: Vec<Axis>,
     /// The most an invocation's box of it may take in memory.
     max_bytes: usize,
+}
+
+/// A coordinate a join equates between its probe scan and a joined scan.
+#[derive(Debug, Clone, PartialEq)]
+struct Axis {
+    probe: String,
+    build: String,
+    /// Added to the probe's values to meet the build's, in the decoded unit,
+    /// microseconds for a time: one join key for each.
+    offsets: Vec<f64>,
+}
+
+/// A join key: a Zarr scan's coordinate, cast losslessly if at all, plus any
+/// of `offsets`.
+struct Key {
+    coord: String,
+    offsets: Vec<f64>,
 }
 
 /// The joins between `partial` and the `probe` scan whose build sides are Zarr
@@ -723,37 +745,54 @@ fn joined_scans(
 }
 
 /// The coordinates an inner hash join equates between a Zarr scan on its build
-/// side, read row by row, and one on its probe side, as (probe's, build's);
-/// none unless it equates every coordinate the two share, as an invocation
-/// would otherwise read all of the build's along the others.
-fn joined_axes(join: &HashJoinExec) -> Vec<(String, String)> {
-    let coords = |plan: Option<&Arc<dyn ExecutionPlan>>| -> Vec<String> {
+/// side, read row by row, and one on its probe side; none unless it equates
+/// every coordinate the two share, as an invocation would otherwise read all
+/// of the build's along the others. A probe's time may be shifted by
+/// intervals.
+fn joined_axes(join: &HashJoinExec) -> Vec<Axis> {
+    let coords = |plan: Option<&Arc<dyn ExecutionPlan>>| -> Vec<ZarrArrayMeta> {
         plan.and_then(|p| p.downcast_ref::<ZarrExec>())
             .and_then(ZarrExec::store_meta)
-            .map(|meta| meta.coords.iter().map(|c| c.name.clone()).collect())
+            .map(|meta| meta.coords.clone())
             .unwrap_or_default()
     };
     let build = coords(row_source(join.left()));
     if build.is_empty() {
         return vec![];
     }
-    let axes: Vec<(String, String)> = join
+    let probe = coords(probe_scan(join.right()));
+    let is_time = |coords: &[ZarrArrayMeta], name: &str| {
+        coords.iter().any(|c| {
+            c.name == name
+                && c.cf_time_attrs
+                    .as_ref()
+                    .is_some_and(|attrs| attrs.parse().is_ok())
+        })
+    };
+    let axes: Vec<Axis> = join
         .on()
         .iter()
-        .filter_map(|(build, probe)| {
-            let build = build.downcast_ref::<Column>()?;
-            let probe = probe.downcast_ref::<Column>()?;
-            Some((
-                scan_coordinate(join.right(), probe.index())?,
-                scan_coordinate(join.left(), build.index())?,
-            ))
+        .filter_map(|(build_key, probe_key)| {
+            let build_key = scan_key(join.left(), build_key.downcast_ref::<Column>()?.index())?;
+            let probe_key = scan_key(join.right(), probe_key.downcast_ref::<Column>()?.index())?;
+            let shifted = probe_key.offsets != [0.0];
+            if build_key.offsets != [0.0]
+                || shifted
+                    && !(is_time(&probe, &probe_key.coord) && is_time(&build, &build_key.coord))
+            {
+                return None;
+            }
+            Some(Axis {
+                probe: probe_key.coord,
+                build: build_key.coord,
+                offsets: probe_key.offsets,
+            })
         })
         .collect();
-    let probe = coords(probe_scan(join.right()));
     let unjoined = build
         .iter()
-        .filter(|c| probe.contains(c))
-        .any(|c| !axes.iter().any(|(_, b)| b == c));
+        .filter(|c| probe.iter().any(|p| p.name == c.name))
+        .any(|c| !axes.iter().any(|a| a.build == c.name));
     if unjoined {
         return vec![];
     }
@@ -769,6 +808,10 @@ fn probe_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> 
             return Some(node);
         }
         if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+            node = join.right();
+            continue;
+        }
+        if let Some(join) = node.downcast_ref::<CrossJoinExec>() {
             node = join.right();
             continue;
         }
@@ -798,23 +841,29 @@ fn row_source(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> 
     }
 }
 
-/// The coordinate of the Zarr scan under `plan` that `plan`'s column `index`
-/// passes on unchanged, if it is one.
-fn scan_coordinate(plan: &Arc<dyn ExecutionPlan>, mut index: usize) -> Option<String> {
+/// The key `plan`'s column `index` is, if a coordinate of the Zarr scan under
+/// `plan`.
+fn scan_key(plan: &Arc<dyn ExecutionPlan>, mut index: usize) -> Option<Key> {
     let mut node = plan;
     loop {
         if let Some(scan) = node.downcast_ref::<ZarrExec>() {
             let schema = node.schema();
             let name = schema.field(index).name();
             let coords = &scan.store_meta()?.coords;
-            return coords.iter().any(|c| c.name == *name).then(|| name.clone());
+            return coords.iter().any(|c| c.name == *name).then(|| Key {
+                coord: name.clone(),
+                offsets: vec![0.0],
+            });
         }
         if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
-            index = projection.expr()[index]
-                .expr
-                .downcast_ref::<Column>()?
-                .index();
-        } else if let Some(filter) = node.downcast_ref::<FilterExec>() {
+            return expr_key(&projection.expr()[index].expr, projection.input());
+        }
+        if let Some(join) = node.downcast_ref::<CrossJoinExec>() {
+            index = index.checked_sub(join.left().schema().fields().len())?;
+            node = join.right();
+            continue;
+        }
+        if let Some(filter) = node.downcast_ref::<FilterExec>() {
             if let Some(projection) = filter.projection() {
                 index = projection[index];
             }
@@ -828,6 +877,108 @@ fn scan_coordinate(plan: &Arc<dyn ExecutionPlan>, mut index: usize) -> Option<St
             return None;
         };
         node = child;
+    }
+}
+
+/// The key `expr` over `input`'s rows is: a column, a lossless cast of one,
+/// or one plus intervals.
+fn expr_key(expr: &Arc<dyn PhysicalExpr>, input: &Arc<dyn ExecutionPlan>) -> Option<Key> {
+    if let Some(column) = expr.downcast_ref::<Column>() {
+        return scan_key(input, column.index());
+    }
+    if let Some(cast) = expr.downcast_ref::<CastExpr>() {
+        let from = cast.expr().data_type(&input.schema()).ok()?;
+        return lossless(&from, cast.cast_type()).then(|| expr_key(cast.expr(), input))?;
+    }
+    let sum = expr
+        .downcast_ref::<BinaryExpr>()
+        .filter(|b| *b.op() == Operator::Plus)?;
+    let key = expr_key(sum.left(), input)?;
+    let by = offsets(sum.right(), input)?;
+    let mut offsets: Vec<f64> = key
+        .offsets
+        .iter()
+        .flat_map(|a| by.iter().map(move |b| a + b))
+        .collect();
+    offsets.sort_by(f64::total_cmp);
+    offsets.dedup();
+    Some(Key { offsets, ..key })
+}
+
+fn lossless(from: &DataType, to: &DataType) -> bool {
+    let from = match from {
+        DataType::Dictionary(_, values) => values,
+        other => other,
+    };
+    // dropping UTC leaves the instant as it was
+    let utc = |zone: &Option<Arc<str>>| zone.as_deref().is_none_or(|z| z == "UTC" || z == "+00:00");
+    match (from, to) {
+        (DataType::Timestamp(_, a), DataType::Timestamp(_, b)) => a == b || utc(a) && utc(b),
+        _ => from == to,
+    }
+}
+
+/// The intervals `expr` gives over `input`'s rows, in microseconds: a
+/// literal, or a column of rows held here.
+fn offsets(expr: &Arc<dyn PhysicalExpr>, input: &Arc<dyn ExecutionPlan>) -> Option<Vec<f64>> {
+    let values = match (
+        expr.downcast_ref::<Literal>(),
+        expr.downcast_ref::<Column>(),
+    ) {
+        (Some(literal), _) => vec![literal.value().clone()],
+        (_, Some(column)) => held_values(input, column.index())?,
+        _ => return None,
+    };
+    values.iter().map(micros).collect()
+}
+
+fn micros(interval: &ScalarValue) -> Option<f64> {
+    const DAY: f64 = 86_400e6;
+    Some(match interval {
+        ScalarValue::IntervalMonthDayNano(Some(v)) if v.months == 0 => {
+            v.days as f64 * DAY + v.nanoseconds as f64 / 1e3
+        }
+        ScalarValue::IntervalDayTime(Some(v)) => v.days as f64 * DAY + v.milliseconds as f64 * 1e3,
+        ScalarValue::DurationSecond(Some(v)) => *v as f64 * 1e6,
+        ScalarValue::DurationMillisecond(Some(v)) => *v as f64 * 1e3,
+        ScalarValue::DurationMicrosecond(Some(v)) => *v as f64,
+        ScalarValue::DurationNanosecond(Some(v)) => *v as f64 / 1e3,
+        _ => return None,
+    })
+}
+
+/// The values of `plan`'s column `index`, if it passes them on from rows held
+/// here, such as a `VALUES` list's, through the build side of cross joins.
+fn held_values(plan: &Arc<dyn ExecutionPlan>, index: usize) -> Option<Vec<ScalarValue>> {
+    if let Some(join) = plan.downcast_ref::<CrossJoinExec>() {
+        return (index < join.left().schema().fields().len())
+            .then(|| held_values(join.left(), index))?;
+    }
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+        let column = projection.expr()[index].expr.downcast_ref::<Column>()?;
+        return held_values(projection.input(), column.index());
+    }
+    if let Some(source) = plan.downcast_ref::<DataSourceExec>() {
+        let memory = source.data_source().downcast_ref::<MemorySourceConfig>()?;
+        let index = match memory.projection() {
+            Some(projection) => projection[index],
+            None => index,
+        };
+        let mut values = vec![];
+        for batch in memory.partitions().iter().flatten() {
+            let column = batch.column(index);
+            for row in 0..column.len() {
+                values.push(ScalarValue::try_from_array(column, row).ok()?);
+            }
+        }
+        return Some(values);
+    }
+    let passes_on = plan.is::<RepartitionExec>()
+        || plan.is::<CoalescePartitionsExec>()
+        || plan.is::<CooperativeExec>();
+    match plan.children()[..] {
+        [child] if passes_on => held_values(child, index),
+        _ => None,
     }
 }
 
@@ -1545,12 +1696,12 @@ async fn joined_inputs(
     };
     let names: Vec<String> = joined
         .iter()
-        .flat_map(|j| j.axes.iter().map(|(probe, _)| probe.clone()))
+        .flat_map(|j| j.axes.iter().map(|a| a.probe.clone()))
         .collect();
     let probe = Grid::read(probe, &names).await?;
     let mut grids = vec![];
     for j in joined {
-        let names: Vec<String> = j.axes.iter().map(|(_, build)| build.clone()).collect();
+        let names: Vec<String> = j.axes.iter().map(|a| a.build.clone()).collect();
         grids.push(Grid::read(&j.scan, &names).await?);
     }
     let mut inputs = vec![];
@@ -1561,7 +1712,7 @@ async fn joined_inputs(
                 lists.push(run.clone());
                 continue;
             };
-            let boxes = joined_boxes(run, &probe, &grids[i], &joined[i].axes);
+            let boxes = joined_boxes(run, &probe, &grids[i], &joined[i].axes)?;
             if boxes.is_empty() {
                 continue 'runs;
             }
@@ -1595,10 +1746,14 @@ async fn joined_inputs(
     Ok(inputs)
 }
 
-/// A scan's store: its metadata, and the values of the coordinates needed.
+/// A scan's store: its metadata, and the values of the coordinates needed,
+/// times in microseconds since 1970, so that two stores' compare.
 struct Grid {
     meta: ZarrStoreMeta,
     values: HashMap<String, Vec<f64>>,
+    // searched, not scanned: a whole record's hours, for each of tens of
+    // thousands of runs
+    orders: HashMap<String, Order>,
 }
 
 impl Grid {
@@ -1610,11 +1765,34 @@ impl Grid {
             .clone();
         let mut values = HashMap::new();
         for name in names {
-            if !values.contains_key(name) {
-                values.insert(name.clone(), split::coordinate_values(scan, name).await?);
+            if values.contains_key(name) {
+                continue;
             }
+            let mut read = split::coordinate_values(scan, name).await?;
+            let unit = meta
+                .coords
+                .iter()
+                .find(|c| c.name == *name)
+                .and_then(|c| c.cf_time_attrs.as_ref())
+                .and_then(|attrs| attrs.parse().ok());
+            if let Some(unit) = unit {
+                let scale = if unit.is_nanoseconds {
+                    1e-3
+                } else {
+                    unit.multiplier_us as f64
+                };
+                for v in &mut read {
+                    *v = unit.epoch_offset_us as f64 + *v * scale;
+                }
+            }
+            values.insert(name.clone(), read);
         }
-        Ok(Self { meta, values })
+        let orders = values.iter().map(|(n, v)| (n.clone(), order(v))).collect();
+        Ok(Self {
+            meta,
+            values,
+            orders,
+        })
     }
 
     /// The coordinate index that a partition's outer selection is on.
@@ -1680,17 +1858,18 @@ impl Grid {
 
 /// The boxes of `build`'s store that `run`'s chunks of `probe`'s can join with:
 /// along each of `axes`, the build's values within the span of those the
-/// probe's chunk selects, and along any other axis, all of it. A chunk with no
-/// such values along some axis joins nothing, so has no box.
+/// probe's chunk selects, shifted by each of its offsets, and along any other
+/// axis, all of it. A chunk with no such values along some axis joins nothing,
+/// so has no box.
 fn joined_boxes(
     run: &[PartitionSpec],
     probe: &Grid,
     build: &Grid,
-    axes: &[(String, String)],
-) -> Vec<PartitionSpec> {
+    axes: &[Axis],
+) -> Result<Vec<PartitionSpec>> {
     let mut boxes: Vec<PartitionSpec> = vec![];
     let Some(outer) = build.outer() else {
-        return boxes;
+        return Ok(boxes);
     };
     'chunks: for spec in run {
         let extent =
@@ -1699,9 +1878,9 @@ fn joined_boxes(
             outer: CoordSelection::Range(0, extent(outer)),
             extra: vec![],
         };
-        for (probe_name, build_name) in axes {
+        for axis in axes {
             let span = probe
-                .selected(spec, probe_name)
+                .selected(spec, &axis.probe)
                 .into_iter()
                 .filter(|v| !v.is_nan())
                 .fold(None, |span: Option<(f64, f64)>, v| {
@@ -1710,20 +1889,13 @@ fn joined_boxes(
             let Some((low, high)) = span else {
                 continue 'chunks;
             };
-            let within: Vec<usize> = build.values[build_name]
-                .iter()
-                .enumerate()
-                .filter(|(_, v)| (low..=high).contains(*v))
-                .map(|(i, _)| i)
-                .collect();
-            let selection = match within[..] {
-                [] => continue 'chunks,
-                [first, .., last] | [first @ last] if last - first + 1 == within.len() => {
-                    CoordSelection::Range(first, last + 1)
-                }
-                _ => CoordSelection::Indices(within),
-            };
-            let Some(coord) = build.index(build_name) else {
+            let values = &build.values[&axis.build];
+            let within = within(values, build.orders[&axis.build], low, high, &axis.offsets);
+            if within.is_empty() {
+                continue 'chunks;
+            }
+            let selection = selecting(within);
+            let Some(coord) = build.index(&axis.build) else {
                 continue 'chunks;
             };
             if coord == outer {
@@ -1733,11 +1905,97 @@ fn joined_boxes(
             }
         }
         joined.extra.sort_by_key(|(coord, _)| *coord);
-        if !boxes.contains(&joined) {
-            boxes.push(joined);
+        match boxes.iter_mut().find(|b| b.extra == joined.extra) {
+            Some(same) => same.outer = union(&same.outer, &joined.outer),
+            None => boxes.push(joined),
         }
     }
-    boxes
+    for (i, a) in boxes.iter().enumerate() {
+        for b in &boxes[i + 1..] {
+            let overlap = overlaps(&a.outer, &b.outer)
+                && a.extra
+                    .iter()
+                    .zip(&b.extra)
+                    .all(|((_, a), (_, b))| overlaps(a, b));
+            if overlap {
+                return Err(DataFusionError::Plan(
+                    "an invocation's chunks join overlapping boxes of a joined Zarr scan, \
+                     whose rows would be joined twice"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(boxes)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Order {
+    Ascending,
+    Descending,
+    Neither,
+}
+
+fn order(values: &[f64]) -> Order {
+    if values.windows(2).all(|w| w[0] < w[1]) {
+        Order::Ascending
+    } else if values.windows(2).all(|w| w[0] > w[1]) {
+        Order::Descending
+    } else {
+        Order::Neither
+    }
+}
+
+/// The indices of `values`, in `order`, within `[low, high]` shifted by any of
+/// `offsets`, ascending.
+fn within(values: &[f64], order: Order, low: f64, high: f64, offsets: &[f64]) -> Vec<usize> {
+    let mut found = vec![];
+    for o in offsets {
+        let (low, high) = (low + o, high + o);
+        let range = if order == Order::Ascending {
+            values.partition_point(|v| *v < low)..values.partition_point(|v| *v <= high)
+        } else if order == Order::Descending {
+            values.partition_point(|v| *v > high)..values.partition_point(|v| *v >= low)
+        } else {
+            found.extend((0..values.len()).filter(|&i| (low..=high).contains(&values[i])));
+            continue;
+        };
+        found.extend(range);
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+fn indices(selection: &CoordSelection) -> Vec<usize> {
+    match selection {
+        CoordSelection::Range(start, end) => (*start..*end).collect(),
+        CoordSelection::Indices(indices) => indices.clone(),
+    }
+}
+
+fn union(a: &CoordSelection, b: &CoordSelection) -> CoordSelection {
+    let mut all = indices(a);
+    all.extend(indices(b));
+    all.sort_unstable();
+    all.dedup();
+    selecting(all)
+}
+
+/// A selection of `indices`, ascending: a range if they are one.
+fn selecting(indices: Vec<usize>) -> CoordSelection {
+    match indices[..] {
+        [first, .., last] if last - first + 1 == indices.len() => {
+            CoordSelection::Range(first, last + 1)
+        }
+        [only] => CoordSelection::Range(only, only + 1),
+        _ => CoordSelection::Indices(indices),
+    }
+}
+
+fn overlaps(a: &CoordSelection, b: &CoordSelection) -> bool {
+    let b = indices(b);
+    indices(a).iter().any(|i| b.contains(i))
 }
 
 fn decode(output: &Value) -> Result<Vec<RecordBatch>> {
@@ -1987,6 +2245,10 @@ mod tests {
                 .iter()
                 .map(|(name, v)| (name.to_string(), v.clone()))
                 .collect(),
+            orders: axes
+                .iter()
+                .map(|(name, v)| (name.to_string(), order(v)))
+                .collect(),
         }
     }
 
@@ -2016,9 +2278,13 @@ mod tests {
         (era5, clim)
     }
 
-    fn axes() -> Vec<(String, String)> {
+    fn axes() -> Vec<Axis> {
         ["latitude", "longitude"]
-            .map(|a| (a.to_string(), a.to_string()))
+            .map(|a| Axis {
+                probe: a.to_string(),
+                build: a.to_string(),
+                offsets: vec![0.0],
+            })
             .to_vec()
     }
 
@@ -2052,7 +2318,7 @@ mod tests {
             tile(&era5, (50, 100), (4, 9), (25, 31)),
         ];
 
-        let boxes = joined_boxes(&run, &era5, &clim, &axes());
+        let boxes = joined_boxes(&run, &era5, &clim, &axes()).unwrap();
 
         // every hour of 50°N to 30°N by 250°E to 290°E: the one box for both
         assert_eq!(
@@ -2078,7 +2344,7 @@ mod tests {
             extra: vec![],
         }];
 
-        let boxes = joined_boxes(&run, &era5, &clim, &axes());
+        let boxes = joined_boxes(&run, &era5, &clim, &axes()).unwrap();
 
         assert_eq!(
             boxes,
@@ -2101,7 +2367,7 @@ mod tests {
         // the tropics
         let run = [tile(&era5, (0, 50), (8, 11), (25, 31))];
 
-        assert_eq!(joined_boxes(&run, &era5, &clim, &axes()), []);
+        assert_eq!(joined_boxes(&run, &era5, &clim, &axes()).unwrap(), []);
     }
 
     #[test]
@@ -2117,7 +2383,7 @@ mod tests {
         );
         let run = [tile(&era5, (0, 50), (4, 6), (24, 30))];
 
-        let [joined] = &joined_boxes(&run, &era5, &clim, &axes())[..] else {
+        let [joined] = &joined_boxes(&run, &era5, &clim, &axes()).unwrap()[..] else {
             panic!("one box");
         };
 
@@ -2127,6 +2393,47 @@ mod tests {
                 clim.index("latitude").unwrap(),
                 CoordSelection::Indices(vec![0, 2])
             )
+        );
+    }
+
+    #[test]
+    fn a_chunk_joins_the_hours_its_leads_reach() {
+        let hour = 3.6e9;
+        let era5 = grid(
+            "t2m",
+            &[
+                ("time", steps(0.0, hour, 100)),
+                ("latitude", steps(90.0, -10.0, 19)),
+                ("longitude", steps(0.0, 10.0, 36)),
+            ],
+        );
+        let mut axes = axes();
+        axes.push(Axis {
+            probe: "time".into(),
+            build: "time".into(),
+            offsets: [6.0, 24.0, 72.0].map(|h| h * hour).to_vec(),
+        });
+        let at = |t: usize| PartitionSpec {
+            outer: CoordSelection::Range(t, t + 1),
+            extra: vec![],
+        };
+
+        let [early] = &joined_boxes(&[at(10)], &era5, &era5, &axes).unwrap()[..] else {
+            panic!("one box");
+        };
+        let [late] = &joined_boxes(&[at(90)], &era5, &era5, &axes).unwrap()[..] else {
+            panic!("one box");
+        };
+
+        assert_eq!(early.outer, CoordSelection::Indices(vec![16, 34, 82]));
+        assert_eq!(late.outer, CoordSelection::Range(96, 97));
+        assert_eq!(joined_boxes(&[at(99)], &era5, &era5, &axes).unwrap(), []);
+        let [both] = &joined_boxes(&[at(10), at(11)], &era5, &era5, &axes).unwrap()[..] else {
+            panic!("the two hours' boxes merged");
+        };
+        assert_eq!(
+            both.outer,
+            CoordSelection::Indices(vec![16, 17, 34, 35, 82, 83])
         );
     }
 
