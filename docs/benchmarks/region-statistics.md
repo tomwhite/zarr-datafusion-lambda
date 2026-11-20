@@ -23,10 +23,10 @@ ORDER BY r.region
 ```
 
 The boxes are a small table, so every worker is sent it in its fragment and
-joins its own chunks with it. They are written first: DataFusion holds the
-table written first in memory and streams the other past it, so written the
-other way round, the raster would be held in memory and the query would not
-fan out. Every invocation returns a partial row for every box, which the
+joins its own chunks with it. They are written first: Apache DataFusion holds
+the table written first in memory and streams the other past it, so written
+the other way round, the raster would be held in memory and the query would
+not fan out. Every invocation returns a partial row for every box, which the
 dispatchers merge as for the [zonal mean](zonal-mean.md).
 
 ## Running it
