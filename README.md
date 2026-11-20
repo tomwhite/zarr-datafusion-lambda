@@ -21,6 +21,7 @@ in time and cost.
 | [Regridding](docs/benchmarks/regridding.md) | joined with weights from S3, finished and written to Zarr by the workers | 2015–2024 | 66s | $0.87 | xarray |
 | [Wind speed](docs/benchmarks/wind-speed.md) | no aggregate, written to Zarr by the workers | 2015–2024 | 58s | $0.78 | xarray |
 | [Anomaly](docs/benchmarks/anomaly.md) | joined with its climatology, written to Zarr first, and written to Zarr by the workers | 2019–2024 | 152s | $1.26 | xarray |
+| [Forecast skill](docs/benchmarks/forecast-skill.md) | joined with itself hours later, merged in the dispatchers | 2019–2023 | 78s | $1.69 | xarray |
 
 ## How it works
 
@@ -58,6 +59,11 @@ For the [anomaly](docs/benchmarks/anomaly.md), the climatology is written to
 Zarr first, and the query is joined with that store: each worker reads a
 pencil of ERA5 and the climatology's chunk over the same cells, and writes the
 pencil's chunk of the output itself.
+
+For the [forecast skill](docs/benchmarks/forecast-skill.md), ERA5 is joined
+with itself at each lead: each worker reads an hour of ERA5 as the forecast
+and the hours its leads reach as the truth, and returns a partial row for
+each lead, which the dispatchers merge.
 
 This project is set up for running benchmarks, it is not a general purpose SQL engine.
 
