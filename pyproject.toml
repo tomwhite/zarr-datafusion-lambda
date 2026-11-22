@@ -8,7 +8,7 @@ requires-python = ">=3.12"
 dependencies = [
     "boto3>=1.40.61",
     "click>=8.1",
-    "map-lambda[deploy]==0.2.1",
+    "map-lambda[deploy]==0.3.1",
     "numpy",
     "pyarrow",
     "tqdm",

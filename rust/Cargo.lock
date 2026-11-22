@@ -3639,8 +3639,8 @@ dependencies = [
 
 [[package]]
 name = "map-lambda-client"
-version = "0.2.1"
-source = "git+https://github.com/tomwhite/map-lambda?tag=v0.2.1#89ab48f52a5ed38f70c1a183928a09e8780a91f4"
+version = "0.3.1"
+source = "git+https://github.com/tomwhite/map-lambda?tag=v0.3.1#d7dfa95196d6f8d347199154c7d860e8eb205210"
 dependencies = [
  "async-stream",
  "aws-config",
@@ -3656,8 +3656,8 @@ dependencies = [
 
 [[package]]
 name = "map-lambda-combiner"
-version = "0.2.1"
-source = "git+https://github.com/tomwhite/map-lambda?tag=v0.2.1#89ab48f52a5ed38f70c1a183928a09e8780a91f4"
+version = "0.3.1"
+source = "git+https://github.com/tomwhite/map-lambda?tag=v0.3.1#d7dfa95196d6f8d347199154c7d860e8eb205210"
 dependencies = [
  "serde",
  "serde_json",
@@ -3665,8 +3665,8 @@ dependencies = [
 
 [[package]]
 name = "map-lambda-dispatcher"
-version = "0.2.1"
-source = "git+https://github.com/tomwhite/map-lambda?tag=v0.2.1#89ab48f52a5ed38f70c1a183928a09e8780a91f4"
+version = "0.3.1"
+source = "git+https://github.com/tomwhite/map-lambda?tag=v0.3.1#d7dfa95196d6f8d347199154c7d860e8eb205210"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -3685,8 +3685,8 @@ dependencies = [
 
 [[package]]
 name = "map-lambda-protocol"
-version = "0.2.1"
-source = "git+https://github.com/tomwhite/map-lambda?tag=v0.2.1#89ab48f52a5ed38f70c1a183928a09e8780a91f4"
+version = "0.3.1"
+source = "git+https://github.com/tomwhite/map-lambda?tag=v0.3.1#d7dfa95196d6f8d347199154c7d860e8eb205210"
 dependencies = [
  "serde",
  "serde_json",
