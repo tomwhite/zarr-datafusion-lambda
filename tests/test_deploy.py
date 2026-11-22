@@ -4,7 +4,7 @@ from map_lambda.deploy import spec
 
 from zarr_datafusion_lambda.cli import cli
 from zarr_datafusion_lambda.deploy import PROJECT, SPEC
-from zarr_datafusion_lambda.runs import COMBINER, FUNCTION
+from zarr_datafusion_lambda.sql import COMBINER, WORKER
 
 
 def test_the_project_is_the_distribution_s_name():
@@ -13,7 +13,7 @@ def test_the_project_is_the_distribution_s_name():
 
 def test_the_spec_deploys_the_worker_the_client_calls():
     (fragment,) = spec.load(SPEC).functions
-    assert fragment.name == FUNCTION
+    assert fragment.name == WORKER
 
 
 def test_the_spec_deploys_the_dispatchers_the_client_calls():

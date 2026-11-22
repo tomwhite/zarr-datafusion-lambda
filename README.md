@@ -50,13 +50,12 @@ uvx --python 3.12 zarr-datafusion-lambda deploy
 Download the notebook, and open it in Jupyter:
 
 ```shell
-curl -LO https://raw.githubusercontent.com/tomwhite/zarr-datafusion-lambda/v0.1.0.dev2/examples/query.ipynb
-uv run --no-project --python 3.12 --with zarr-datafusion-lambda --with jupyterlab --with ipywidgets --with pandas jupyter lab query.ipynb
+curl -LO https://raw.githubusercontent.com/tomwhite/zarr-datafusion-lambda/v0.1.0.dev2/examples/quickstart.ipynb
+uv run --no-project --python 3.12 --with zarr-datafusion-lambda --with "map-lambda[diagnostics]" --with jupyterlab --with ipywidgets --with pandas jupyter lab quickstart.ipynb
 ```
 
-Run its cells: the first query is the daily global mean of the 2m
-temperature over a week of 2020. Edit it to query other windows, or print a
-query's plan with `sql.explain` before running it.
+Run its cells: the query is the monthly global mean of the 2m
+temperature over 2020, which prints its stats and its cost after it runs.
 
 The lambdas cost nothing while they aren't running, apart from storing their
 logs, so you can leave them deployed. To tidy up once you're done with them:
@@ -151,32 +150,37 @@ export AWS_REGION=us-east-1
 ```
 
 With the deployment from a release, and `UV_FIND_LINKS` as above, this runs
-the notebook's first query from a script, with the package's `sql` module:
+the Quickstart notebook's query from a script, with the package's `sql` module:
 
 ```shell
 uv run --no-project --python 3.12 --with zarr-datafusion-lambda python - <<'EOF'
 from zarr_datafusion_lambda import sql
 
-tables = {"era5": {"url": "s3://earthmover-icechunk-era5/icechunkV2", "group": "single/spatial"}}
+era5 = sql.Session(
+    {"era5": {"url": "s3://earthmover-icechunk-era5/icechunkV2", "group": "single/spatial"}},
+    concurrency=990,
+)
 query = """
-SELECT date_trunc('day', CAST(valid_time AS TIMESTAMP))                 AS day,
+SELECT date_trunc('month', CAST(valid_time AS TIMESTAMP))              AS month,
        sum(t2m * cos(radians(latitude))) / sum(cos(radians(latitude))) AS mean_t2m
 FROM era5
-WHERE valid_time >= TIMESTAMP '2020-01-01' AND valid_time < TIMESTAMP '2020-01-08'
+WHERE valid_time >= TIMESTAMP '2020-01-01' AND valid_time < TIMESTAMP '2021-01-01'
 GROUP BY 1
 ORDER BY 1
 """
-result = sql.run(query, tables, progress=True)
+result = era5.sql(query, progress=True)
 for row in result.table.to_pylist():
-    print(f"{row['day']:%Y-%m-%d}  {row['mean_t2m']:.2f} K")
-print(f"{result.chunks} chunks in {result.invocations} invocations")
+    print(f"{row['month']:%Y-%m}  {row['mean_t2m']:.2f} K")
+print(result.stats())
+print(result.cost())
 EOF
 ```
 
-From a checkout, with the package built from source, the notebook opens with:
+From a checkout, with the package built from source, the notebooks in
+`examples/` open with:
 
 ```shell
-uv run --with jupyterlab --with ipywidgets --with pandas jupyter lab examples/query.ipynb
+uv run --with jupyterlab --with ipywidgets --with pandas jupyter lab examples/
 ```
 
 ## Development

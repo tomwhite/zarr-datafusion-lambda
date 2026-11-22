@@ -4,23 +4,17 @@ it did, what CloudWatch's REPORT lines say it cost, and its timeline.
 """
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
 
-import boto3
 import numpy as np
 from map_lambda import DISPATCHER, Session
+from map_lambda import cost as lambda_cost
 
-from zarr_datafusion_lambda import cost, sql
-from zarr_datafusion_lambda.cloudwatch import join, query_all_reports, query_windows
+from zarr_datafusion_lambda import sql
 from zarr_datafusion_lambda.deploy import PROJECT
-
-FUNCTION = "fragment"
-
-# keep in sync with `COMBINER` in rust/split
-COMBINER = "partial-reduce"
+from zarr_datafusion_lambda.sql import COMBINER, WORKER
 
 
 def describe(name: str, values: list[float]) -> str:
@@ -36,27 +30,16 @@ def run(query: str, tables: dict[str, sql.Table], **settings: Any) -> dict[str, 
     Run `query` as `sql.run` does, with one fan-out and a progress bar: its
     rows, and what each invocation, worker and dispatcher did.
     """
-    started = time.monotonic()
-    result = sql.run(query, tables, progress=True, return_stats=True, **settings)
-    wall = time.monotonic() - started
+    result = sql.run(query, tables, progress=True, **settings)
     [report] = result.reports
     # each worker's output, or with a combine, each state its dispatcher merged
     responses = report["workers"]
     combined = any("indexes" in r for r in responses)
-    # A state's requests can't be told apart by invocation, so they count
-    # against its first.
-    requests = {(r["indexes"][0] if combined else r["index"]): r["s3_requests"] for r in responses}
-    none = {"gets": 0, "lists": 0}
     return {
         "chunks": report["chunks"],
         "combined": combined,
         "invocations": [
-            {
-                **r,
-                "s3_gets": requests.get(r["index"], none)["gets"],
-                "s3_lists": requests.get(r["index"], none)["lists"],
-            }
-            for r in report["invocation_stats"]
+            {k: v for k, v in r.items() if k != "fan_out"} for r in result.invocation_stats
         ],
         "dispatchers": report["dispatcher_stats"],
         "arrivals": report["arrivals"],
@@ -64,7 +47,7 @@ def run(query: str, tables: dict[str, sql.Table], **settings: Any) -> dict[str, 
         "timings": [] if combined else [r["timings_ms"] for r in responses],
         "chunks_in_flight": [] if combined else sorted({r["chunks_in_flight"] for r in responses}),
         "rows": result.table.to_pylist(),
-        "wall_s": wall,
+        "wall_s": result.wall_s,
         "fan_out_s": report["elapsed_s"],
     }
 
@@ -145,61 +128,40 @@ def report(result: dict[str, Any], saved: Path) -> None:
     and `chunks_per_invocation`, and what it cost, and its timeline.
     """
     print("waiting for CloudWatch Logs Insights...", flush=True)
-    # where the Lambda client invoked: boto3 reads only AWS_DEFAULT_REGION
-    logs = boto3.client("logs", region_name=os.environ.get("AWS_REGION"))
-    # the dispatchers' REPORT lines fall in their workers' windows too
-    windows = query_windows(result["invocations"])
     deployed = Session(project=PROJECT)
-    workers = join(
-        result["invocations"],
-        query_all_reports(
-            logs,
-            deployed.function_name(FUNCTION),
-            {r["req_id"] for r in result["invocations"]},
-            windows,
-        ),
+    dispatcher = f"{DISPATCHER}-{COMBINER}" if result.get("combined") else DISPATCHER
+
+    def progress(line: str) -> None:
+        print(f"  {line}", flush=True)
+
+    workers = lambda_cost.fetch_reports(
+        result["invocations"], deployed.function_name(WORKER), on_progress=progress
     )
-    dispatchers = join(
-        result["dispatchers"],
-        query_all_reports(
-            logs,
-            deployed.function_name(
-                f"{DISPATCHER}-{COMBINER}" if result.get("combined") else DISPATCHER
-            ),
-            {c["req_id"] for c in result["dispatchers"]},
-            windows,
-        ),
+    dispatchers = lambda_cost.fetch_reports(
+        result["dispatchers"], deployed.function_name(dispatcher), on_progress=progress
     )
     cold = sum(w["init_ms"] is not None for w in workers)
+    expected = len(result["invocations"]) + len(result["dispatchers"])
     print(
         f"{len(workers):,} of {len(result['invocations']):,} workers, {cold:,} cold; "
         f"{len(dispatchers)} of {len(result['dispatchers'])} dispatchers"
         + (
             " (the rest are missing from the cost)"
-            if len(workers) + len(dispatchers)
-            < len(result["invocations"]) + len(result["dispatchers"])
+            if len(workers) + len(dispatchers) < expected
             else ""
         )
     )
-    print(describe("handler", [w["duration_ms"] for w in workers]))
+    print(describe("handler", [w["execution_ms"] for w in workers]))
     # past its own elapsed_ms, it is still streaming results to the client
-    print(describe("dispatch", [c["duration_ms"] for c in dispatchers]))
+    print(describe("dispatch", [c["execution_ms"] for c in dispatchers]))
     if workers:
         print(
             f"   memory: max {max(w['max_memory_mb'] for w in workers):.0f} MB "
             f"of {max(w['memory_size_mb'] for w in workers):.0f} MB"
         )
-    # dispatchers make no S3 requests
-    spend = cost.actual(workers + [{**c, "s3_gets": 0, "s3_lists": 0} for c in dispatchers])
-    print(cost.summarize_actual(spend) if spend else "no REPORT lines found, so no cost")
-    ran = {w["req_id"]: w for w in workers}
-    draw(
-        result,
-        [
-            {**r, "execution_ms": w["duration_ms"], "init_ms": w["init_ms"]}
-            if (w := ran.get(r["req_id"]))
-            else r
-            for r in result["invocations"]
-        ],
-        saved,
+    priced = workers + dispatchers
+    print(
+        lambda_cost.estimate_cost(priced, missing=expected - len(priced)) if priced else "no cost"
     )
+    ran = {w["req_id"]: w for w in workers}
+    draw(result, [ran.get(r["req_id"], r) for r in result["invocations"]], saved)
