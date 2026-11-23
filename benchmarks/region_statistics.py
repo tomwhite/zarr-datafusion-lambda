@@ -4,8 +4,8 @@ xarray-sql's region statistics of `t2m` over Earthmover's ERA5,
 window of hourly chunks, a range join with the boxes as `VALUES`. The boxes
 are written first, so they are the join's build side, and every worker is
 sent them in its fragment. Each invocation returns a partial row for each
-box, which the dispatchers merge, unless `--no-combine`. The workers must be
-in the bucket's region, as the deploy spec fixes:
+box, which the dispatchers merge. The workers must be in the bucket's
+region, as the deploy spec fixes:
 
 \b
     uv run zarr-datafusion-lambda deploy --from-source
@@ -97,12 +97,6 @@ def check(rows: list[dict[str, Any]], start: datetime, end: datetime) -> list[st
 @click.option(
     "--end", type=click.DateTime(), metavar="DATE", default=datetime(2020, 2, 1), show_default=True
 )
-@click.option(
-    "--combine/--no-combine",
-    default=True,
-    show_default=True,
-    help="Merge the workers' partial rows in the dispatchers.",
-)
 @click.option("--concurrency", default=990, show_default=True)
 @click.option("--dispatchers", type=int)
 @click.option("--chunks-per-invocation", default=24, show_default=True)
@@ -119,7 +113,6 @@ def main(
     url: str,
     start: datetime,
     end: datetime,
-    combine: bool,
     concurrency: int,
     dispatchers: int | None,
     chunks_per_invocation: int,
@@ -142,7 +135,6 @@ def main(
         "dispatchers": dispatchers,
         "chunks_per_invocation": chunks_per_invocation,
         "chunks_in_flight": chunks_in_flight,
-        "config": {"lambda.combine": str(combine).lower()},
     }
     if explain:
         click.echo(sql.explain(query(start, end), tables, **settings))

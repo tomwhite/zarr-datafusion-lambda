@@ -331,11 +331,10 @@ def reference(tmp_path, case):
 
 
 @pytest.mark.lambda_integration
-@pytest.mark.parametrize("combine", ["true", "false"])
 @pytest.mark.parametrize("name", CUT)
-def test_a_case_with_lambdas_matches_xarray(tmp_path, name, combine):
+def test_a_case_with_lambdas_matches_xarray(tmp_path, name):
     case = CASES[name]
-    result = answer(tmp_path, case, config={"lambda.combine": combine})
+    result = answer(tmp_path, case)
 
     assert result.chunks
     rows_close(result.table.to_pylist(), reference(tmp_path, case))

@@ -23,9 +23,6 @@ from tests.stores import (
 )
 from zarr_datafusion_lambda.sql import explain, location, run, session
 
-# for what each worker measured, which a combine sums
-UNCOMBINED = {"lambda.combine": "false"}
-
 # neither bound falls on a chunk boundary
 WINDOW = "time >= TIMESTAMP '1979-01-15 03:00:00' AND time < TIMESTAMP '1979-03-01 00:00:00'"
 
@@ -118,14 +115,15 @@ QUERIES = [
     "SELECT CAST(time AS TIMESTAMP) AS hour, avg(t2m) AS mean, count(*) AS n "
     "FROM era5 GROUP BY 1 ORDER BY 1",
 ]
+# finished on the workers, so each worker's measurements reach the client
+# rather than being merged in the dispatchers
+FINISHED = QUERIES[-1]
 
 
 @pytest.mark.lambda_integration
-@pytest.mark.parametrize("combine", ["true", "false"])
 @pytest.mark.parametrize("query", [*WINDOWED.values(), *QUERIES])
-def test_queries_match_one_process(era5, query, combine):
-    config = {"lambda.combine": combine}
-    result = run(query, {"era5": era5}, **LOCAL, chunks_per_invocation=7, config=config)
+def test_queries_match_one_process(era5, query):
+    result = run(query, {"era5": era5}, **LOCAL, chunks_per_invocation=7)
 
     assert result.chunks
     rows_close(result.table.to_pylist(), query_locally(era5, query))
@@ -133,14 +131,7 @@ def test_queries_match_one_process(era5, query, combine):
 
 @pytest.mark.lambda_integration
 def test_every_invocation_has_its_workers_measurements(era5):
-    result = run(
-        QUERIES[0],
-        {"era5": era5},
-        **LOCAL,
-        chunks_per_invocation=7,
-        return_stats=True,
-        config=UNCOMBINED,
-    )
+    result = run(FINISHED, {"era5": era5}, **LOCAL, chunks_per_invocation=7, return_stats=True)
 
     [report] = result.reports
     indexes = sorted(r["index"] for r in report["invocation_stats"])
@@ -200,20 +191,18 @@ def test_dispatchers_share_the_invocations_with_the_same_answer(era5):
 @pytest.mark.lambda_integration
 @pytest.mark.parametrize("in_flight", [1, 3])
 def test_chunks_in_flight_give_the_same_answer(era5, in_flight):
-    query = WINDOWED["zonal-mean"]
     result = run(
-        query,
+        FINISHED,
         {"era5": era5},
         **LOCAL,
         chunks_per_invocation=7,
         chunks_in_flight=in_flight,
         return_stats=True,
-        config=UNCOMBINED,
     )
 
     [report] = result.reports
     assert {w["chunks_in_flight"] for w in report["workers"]} == {in_flight}
-    rows_close(result.table.to_pylist(), query_locally(era5, query))
+    rows_close(result.table.to_pylist(), query_locally(era5, FINISHED))
 
 
 # A persistence-forecast error: each cell against itself a day later, which
@@ -282,11 +271,8 @@ def test_explain_with_lambdas_disabled_has_no_fragments(era5_metadata):
     assert "fragment:" not in plan
 
 
-def test_a_fan_out_combines_unless_set_not_to(era5_metadata):
-    tables = {"era5": era5_metadata}
-
-    assert "combiner=partial-reduce" in explain(QUERIES[0], tables, **LOCAL)
-    assert "combiner=none" in explain(QUERIES[0], tables, **LOCAL, config=UNCOMBINED)
+def test_a_fan_out_of_partial_rows_is_merged_in_the_dispatchers(era5_metadata):
+    assert "combiner=partial-reduce" in explain(QUERIES[0], {"era5": era5_metadata}, **LOCAL)
 
 
 def test_a_misspelt_lambda_option_is_refused(era5_metadata):
