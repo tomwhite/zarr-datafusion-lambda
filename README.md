@@ -84,6 +84,11 @@ in time and cost.
 | [Anomaly](docs/benchmarks/anomaly.md) | joined with its climatology, written to Zarr first, and written to Zarr by the workers | 2019–2024 | 152s | $1.26 | xarray |
 | [Forecast skill](docs/benchmarks/forecast-skill.md) | joined with itself hours later, merged in the dispatchers | 2019–2023 | 78s | $1.69 | xarray |
 
+xarray-sql's reprojection (case 7) isn't benchmarked. It transforms
+coordinates, not data values, and ERA5's coordinates are one grid, the same
+every hour, so there is nothing to fan out. Its [warp](docs/benchmarks/warp.md)
+(case 9) needs the same transform, done once in a prep script.
+
 Each benchmark runs from a checkout, deployed [from source](#from-source),
 which builds the client from source too, and saves its run to `results/`,
 with a timeline of its invocations.
