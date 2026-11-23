@@ -79,6 +79,7 @@ in time and cost.
 | [Region statistics](docs/benchmarks/region-statistics.md) | joined with a small table | 1940–2024 | 102s | $2.49 | xarray |
 | [Hourly climatology](docs/benchmarks/climatology.md) | finished and written to Zarr by the workers | 1940–2025 | 136s | $3.07 | xarray |
 | [Regridding](docs/benchmarks/regridding.md) | joined with weights from S3, finished and written to Zarr by the workers | 2015–2024 | 66s | $0.87 | xarray |
+| [Warp](docs/benchmarks/warp.md) | joined with bilinear weights onto a projected grid from S3, finished and written to Zarr by the workers | 2015–2024 | 59s | $0.52 | xarray |
 | [Wind speed](docs/benchmarks/wind-speed.md) | no aggregate, written to Zarr by the workers | 2015–2024 | 58s | $0.78 | xarray |
 | [Anomaly](docs/benchmarks/anomaly.md) | joined with its climatology, written to Zarr first, and written to Zarr by the workers | 2019–2024 | 152s | $1.26 | xarray |
 | [Forecast skill](docs/benchmarks/forecast-skill.md) | joined with itself hours later, merged in the dispatchers | 2019–2023 | 78s | $1.69 | xarray |
