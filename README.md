@@ -122,7 +122,6 @@ which has credentials already set, once uv is installed:
 
 ```shell
 curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.local/bin/env
 export UV_CACHE_DIR=/tmp/uv-cache   # CloudShell's home directory is limited to 1 GB
 ```
 
