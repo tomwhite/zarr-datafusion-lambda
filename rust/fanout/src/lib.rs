@@ -111,12 +111,6 @@ extensions_options! {
         /// Whether a plan that can be cut fans out: `SET lambda.enabled = false`
         /// runs every plan in this process, as plain zarr-datafusion would.
         pub enabled: bool, default = true
-        /// Whether each dispatcher merges its workers' partial rows into one
-        /// a group before they reach this process, through a dispatcher
-        /// built with the `partial-reduce` combiner. Without it, every
-        /// worker's rows stream back, which Lambda holds to 2 MB/s a
-        /// dispatcher after its first 6 MB.
-        pub combine: bool, default = true
         /// The most a join's table read from files may take in memory, decoded,
         /// for every worker to read it whole and join its chunks with it: well
         /// under a worker's memory, which holds its chunks in flight too.
@@ -276,13 +270,12 @@ impl PhysicalOptimizerRule for FanOutRule {
         if !options.is_none_or(|options| options.enabled) {
             return Ok(plan);
         }
-        let combine = options.is_none_or(|options| options.combine);
         let broadcast_bytes = options.map_or(LambdaOptions::default().broadcast_bytes, |options| {
             options.broadcast_bytes
         });
         let plan = plan
             .transform_up(|node| {
-                let exec = match self.cut(&node, combine, broadcast_bytes)? {
+                let exec = match self.cut(&node, broadcast_bytes)? {
                     Some(exec) => Some(exec),
                     None => match finish(&node)? {
                         Some(exec) => Some(exec),
@@ -318,7 +311,6 @@ impl FanOutRule {
     fn cut(
         &self,
         node: &Arc<dyn ExecutionPlan>,
-        combine: bool,
         broadcast_bytes: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let Some(partial) = node
@@ -348,9 +340,7 @@ impl FanOutRule {
             self.0.clone(),
         )?;
         exec.joined = joined_scans(node, probe, broadcast_bytes);
-        if combine {
-            exec.reduce = split::encode_reduce(&exec.plan)?;
-        }
+        exec.reduce = split::encode_reduce(&exec.plan)?;
         Ok(Some(Arc::new(exec)))
     }
 }
