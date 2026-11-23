@@ -5,11 +5,11 @@ window of hourly chunks, a range join with the boxes as `VALUES`. The boxes
 are written first, so they are the join's build side, and every worker is
 sent them in its fragment. Each invocation returns a partial row for each
 box, which the dispatchers merge. The workers must be in the bucket's
-region, as the deploy spec fixes:
+region, us-east-1:
 
 \b
-    uv run zarr-datafusion-lambda deploy --from-source
     export AWS_REGION=us-east-1
+    uv run zarr-datafusion-lambda deploy --from-source
     uv run python benchmarks/region_statistics.py --start 2020-01-01 --end 2020-02-01
 
 It checks each box's count and that its mean is plausible;

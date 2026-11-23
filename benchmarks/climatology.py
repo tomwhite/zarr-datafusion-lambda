@@ -1,12 +1,12 @@
 """
 The hourly climatology of `t2m` over Earthmover's ERA5 pencils,
 `single/temporal`, written to a Zarr store by the workers, a chunk a tile.
-The workers must be in the bucket's region, as the deploy spec fixes, and
+The workers must be in the bucket's region, us-east-1, and
 allowed to write to the output's:
 
 \b
-    uv run zarr-datafusion-lambda deploy --from-source --allow-bucket ...
     export AWS_REGION=us-east-1
+    uv run zarr-datafusion-lambda deploy --from-source --allow-bucket ...
     uv run python benchmarks/climatology.py s3://.../climatology.zarr
 
 By default a week, inside one band of pencils: it still writes every tile, but

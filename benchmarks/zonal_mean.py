@@ -3,11 +3,11 @@ xarray-sql's zonal mean of `t2m` over Earthmover's ERA5, `single/spatial`:
 the mean of each of 721 latitudes over a window of hourly chunks. Every
 invocation returns a partial row for each latitude, which the dispatchers
 merge before they reach the client. The workers must be in the bucket's
-region, as the deploy spec fixes:
+region, us-east-1:
 
 \b
-    uv run zarr-datafusion-lambda deploy --from-source
     export AWS_REGION=us-east-1
+    uv run zarr-datafusion-lambda deploy --from-source
     uv run python benchmarks/zonal_mean.py --start 2020-01-01 --end 2020-02-01
 
 It checks each latitude's count and that its mean is plausible;

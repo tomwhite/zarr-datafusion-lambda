@@ -1,11 +1,11 @@
 """
 The demo: the monthly area-weighted global mean of `t2m` over Earthmover's
 ERA5, an Icechunk repo in us-east-1, fanned out from a window's hourly
-chunks. The workers must be in the bucket's region, as the deploy spec fixes:
+chunks. The workers must be in the bucket's region, us-east-1:
 
 \b
-    uv run zarr-datafusion-lambda deploy --from-source
     export AWS_REGION=us-east-1
+    uv run zarr-datafusion-lambda deploy --from-source
     uv run python benchmarks/demo.py --start 2020-01-01 --end 2020-04-01
 
 It checks that pruning kept exactly the window's chunks, each month's count,

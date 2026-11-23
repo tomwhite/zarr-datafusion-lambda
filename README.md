@@ -38,11 +38,12 @@ This project is set up for running benchmarks, it is not a general purpose SQL e
 This deploys the lambdas to your AWS account and queries ERA5 from a Jupyter
 notebook. It needs [uv](https://docs.astral.sh/uv/), and AWS credentials,
 found as the `aws` CLI finds them. ERA5 is read anonymously from Earthmover's
-public bucket in us-east-1, which is where the lambdas are deployed too.
+public bucket in us-east-1, so the lambdas are deployed there too.
 
 Deploy the lambdas from the latest release:
 
 ```shell
+export AWS_REGION=us-east-1
 export UV_FIND_LINKS=https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev2
 uvx --python 3.12 zarr-datafusion-lambda deploy
 ```
@@ -101,10 +102,12 @@ stack holding `zarr-datafusion-lambda-dispatcher`,
 `zarr-datafusion-lambda-dispatcher-partial-reduce`, which merges the workers'
 partial rows, `zarr-datafusion-lambda-fragment`, their roles and their logs.
 
-The data is in us-east-1, so the workers must be there too (a query refuses
-to run otherwise), which the spec fixes. ERA5 is read anonymously, so a
-bucket only needs allowing for a query that writes to it, such as a `COPY …
-STORED AS ZARR`.
+The workers must be in the same region as the data they read: a query over a
+bucket in another region is refused, naming the bucket's region. They are
+deployed in the region `--region` names, or else the environment's
+(`AWS_REGION`, or the profile's), so for ERA5, us-east-1. ERA5 is read
+anonymously, so a bucket only needs allowing for a query that writes to it,
+such as a `COPY … STORED AS ZARR`.
 
 ### From a release
 
@@ -113,6 +116,7 @@ This needs only uv: the wheels and the lambda zips come from this project's
 and map-lambda from PyPI:
 
 ```shell
+export AWS_REGION=us-east-1
 export UV_FIND_LINKS=https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev2
 uvx --python 3.12 zarr-datafusion-lambda deploy --allow-bucket <bucket>
 uvx --python 3.12 zarr-datafusion-lambda list      # what is deployed
@@ -137,6 +141,7 @@ From a checkout, building needs Rust, [Zig](https://ziglang.org/) and
 [cargo lambda](https://www.cargo-lambda.info/):
 
 ```shell
+export AWS_REGION=us-east-1
 uv run zarr-datafusion-lambda deploy --from-source --allow-bucket <bucket>
 uv run zarr-datafusion-lambda list
 uv run zarr-datafusion-lambda delete
@@ -148,7 +153,8 @@ Deploy again after any change; the stack remembers the bucket.
 
 The client finds AWS credentials in the same way as the `aws` CLI, so a
 profile, SSO or CloudShell all work, and `AWS_*` variables take precedence.
-The workers are in us-east-1, so the client's region must be too:
+The client invokes the workers in its own region, so it must be the one they
+are deployed in, us-east-1 for ERA5:
 
 ```shell
 export AWS_REGION=us-east-1
