@@ -10,8 +10,8 @@ their region:
 
 \b
     uv run benchmarks/warp_weights.py s3://<bucket>/era5-laea-weights.parquet
-    uv run zarr-datafusion-lambda deploy --from-source --allow-bucket <bucket>
     export AWS_REGION=us-east-1
+    uv run zarr-datafusion-lambda deploy --from-source --allow-bucket <bucket>
     uv run python benchmarks/warp.py s3://<bucket>/warped-2020-01.zarr \\
         --weights s3://<bucket>/era5-laea-weights.parquet
 

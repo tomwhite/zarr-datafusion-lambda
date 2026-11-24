@@ -6,8 +6,8 @@ with no aggregate. Each worker writes a day's chunk, so write it to a bucket
 the workers may write, in their region:
 
 \b
-    uv run zarr-datafusion-lambda deploy --from-source --allow-bucket <bucket>
     export AWS_REGION=us-east-1
+    uv run zarr-datafusion-lambda deploy --from-source --allow-bucket <bucket>
     uv run python benchmarks/wind_speed.py s3://<bucket>/wind-speed-2020-01.zarr
 
 By default a month, 31 invocations, writing about 3 GB before compression.

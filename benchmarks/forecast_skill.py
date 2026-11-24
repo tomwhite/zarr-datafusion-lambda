@@ -7,8 +7,8 @@ joins them on the workers, and returns a partial row for each lead, which the
 dispatchers merge before they reach the client:
 
 \b
-    uv run zarr-datafusion-lambda deploy --from-source
     export AWS_REGION=us-east-1
+    uv run zarr-datafusion-lambda deploy --from-source
     uv run python benchmarks/forecast_skill.py --start 2020-01-06 --end 2020-01-13
 
 It checks each lead's count and that its RMSE is plausible;

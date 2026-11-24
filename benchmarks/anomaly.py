@@ -7,8 +7,8 @@ joined with that store, each worker reading a tile's pencils and the tile's
 chunk of the climatology:
 
 \b
-    uv run zarr-datafusion-lambda deploy --from-source --allow-bucket <bucket>
     export AWS_REGION=us-east-1
+    uv run zarr-datafusion-lambda deploy --from-source --allow-bucket <bucket>
     uv run python benchmarks/anomaly.py s3://<bucket>/anomaly-2020.zarr \\
         --climatology s3://<bucket>/anomaly-2020-climatology.zarr
 

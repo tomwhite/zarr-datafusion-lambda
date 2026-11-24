@@ -9,8 +9,8 @@ bucket the workers may read and write, in their region:
 
 \b
     uv run python benchmarks/regrid_weights.py s3://<bucket>/era5-1deg-weights.parquet
-    uv run zarr-datafusion-lambda deploy --from-source --allow-bucket <bucket>
     export AWS_REGION=us-east-1
+    uv run zarr-datafusion-lambda deploy --from-source --allow-bucket <bucket>
     uv run python benchmarks/regridding.py s3://<bucket>/regridded-2020-01.zarr \\
         --weights s3://<bucket>/era5-1deg-weights.parquet
 

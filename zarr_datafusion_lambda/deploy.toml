@@ -3,8 +3,6 @@
 project = "zarr-datafusion-lambda"
 workspace = "../rust"
 release_url = "https://github.com/tomwhite/zarr-datafusion-lambda/releases/download/v{version}"
-# next to ERA5, which a query refuses to read from another region
-region = "us-east-1"
 
 [combiners.partial-reduce]
 
