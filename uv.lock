@@ -429,12 +429,12 @@ wheels = [
 
 [[package]]
 name = "map-lambda"
-version = "0.3.1"
+version = "0.3.2"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/34/a8/5e5cae540ea20c7548d7784638b89a5f5c8dfbf71823c328db580c6375ff/map_lambda-0.3.1-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:e693d00d8560b6e730331244aa587c44fe21b8b2e6399106a232bd7277c5e525", size = 6331090, upload-time = "2026-11-23T12:43:06.925Z" },
-    { url = "https://files.pythonhosted.org/packages/7f/39/fce624787162c17329f6af2a5d5bc5f0914a194839305474d6baa4eccfec/map_lambda-0.3.1-cp312-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:a3e3196316c76d104e6f701824239eb555211cfebf3cd0740791b6251ee07ea2", size = 7406168, upload-time = "2026-11-23T12:43:08.775Z" },
-    { url = "https://files.pythonhosted.org/packages/ef/c9/c8346faca44258de2652f0ec22314d76bcd9fccc0173240b95386e474ba3/map_lambda-0.3.1-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:03e11327ab78bdcc5e828f8ab530c8a6a5f654b12684db20a0efb4e2826b7eba", size = 7137196, upload-time = "2026-11-23T12:43:10.336Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/78/9f8375aa9436fa0abffa514797bb5f09294238a167b9c599387d07742b18/map_lambda-0.3.2-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:79943a5b7575cbd0fc0149fa78ec5e7a7d435edc4bffb11d64ab0b5c539d3079", size = 6331289, upload-time = "2026-11-24T13:49:28.784Z" },
+    { url = "https://files.pythonhosted.org/packages/33/27/bfa73b63edc567163ebe6b857328579ca8cb4efd063e39a560ebc270a9d9/map_lambda-0.3.2-cp312-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:b672f31621fa781b9caf9d039aa66c2793461bfc6df7115f67abc46c1b50dd4f", size = 7405219, upload-time = "2026-11-24T13:49:30.723Z" },
+    { url = "https://files.pythonhosted.org/packages/33/0e/f17e77d59a464194a89080840b2ba7e4aace3632da996e166b8dd5d22c66/map_lambda-0.3.2-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:d2dd2a5ce0ac2b08258893dfe4830a5bf2f232bb4ff0beb10d3189bdfcafb13a", size = 7137367, upload-time = "2026-11-24T13:49:32.661Z" },
 ]
 
 [package.optional-dependencies]
@@ -1125,7 +1125,7 @@ dev = [
 requires-dist = [
     { name = "boto3", specifier = ">=1.40.61" },
     { name = "click", specifier = ">=8.1" },
-    { name = "map-lambda", extras = ["deploy"], specifier = "==0.3.1" },
+    { name = "map-lambda", extras = ["deploy"], specifier = "==0.3.2" },
     { name = "numpy" },
     { name = "pyarrow" },
     { name = "tqdm" },
