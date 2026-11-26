@@ -71,7 +71,8 @@ Each benchmark has a page explaining how it was run. This table is a summary.
 Note that some of the benchmarks have not been run on the whole ERA5 dataset,
 and have been run by restricting the time window to 5 or 10 years. It is
 expected that they will scale to the whole dataset with a proportional increase
-in time and cost.
+in time and cost. Also, the checks were only run against a month's worth of
+data (or less).
 
 | Benchmark | Shape | Window | Time | Cost | Checked against |
 |---|---|---|---|---|---|
