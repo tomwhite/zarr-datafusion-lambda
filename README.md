@@ -44,14 +44,14 @@ Deploy the lambdas from the latest release:
 
 ```shell
 export AWS_REGION=us-east-1
-export UV_FIND_LINKS=https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev2
+export UV_FIND_LINKS=https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev3
 uvx --python 3.12 zarr-datafusion-lambda deploy
 ```
 
 Download the notebook, and open it in Jupyter:
 
 ```shell
-curl -LO https://raw.githubusercontent.com/tomwhite/zarr-datafusion-lambda/v0.1.0.dev2/examples/quickstart.ipynb
+curl -LO https://raw.githubusercontent.com/tomwhite/zarr-datafusion-lambda/v0.1.0.dev3/examples/quickstart.ipynb
 uv run --no-project --python 3.12 --with zarr-datafusion-lambda --with "map-lambda[diagnostics]" --with jupyterlab --with ipywidgets --with pandas jupyter lab quickstart.ipynb
 ```
 
@@ -118,7 +118,7 @@ and map-lambda from PyPI:
 
 ```shell
 export AWS_REGION=us-east-1
-export UV_FIND_LINKS=https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev2
+export UV_FIND_LINKS=https://github.com/tomwhite/zarr-datafusion-lambda/releases/expanded_assets/v0.1.0.dev3
 uvx --python 3.12 zarr-datafusion-lambda deploy --allow-bucket <bucket>
 uvx --python 3.12 zarr-datafusion-lambda list      # what is deployed
 uvx --python 3.12 zarr-datafusion-lambda delete    # when you're finished; the bucket and its data stay
@@ -226,12 +226,11 @@ pinned to a commit, until the changes it carries are merged upstream.
 
 ### Releasing
 
-Set the version in `pyproject.toml` (`0.1.0.devN` for now), run `uv lock`,
+Set the version in `pyproject.toml` (`0.1.0.devN` for now), run `uv lock`, update the README,
 and push a tag of the same version prefixed with `v`. The release workflow
 builds the dispatchers' and fragment's zips, and wheels for Linux x86-64 and
 arm64 and macOS arm64 carrying the zips' checksums, then attaches them all to
-a GitHub release. Then update the release URLs in the Quickstart and under Deploying and
-querying.
+a GitHub release.
 
 ## AI usage
 
